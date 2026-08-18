@@ -1,0 +1,15 @@
+README.md
+pyproject.toml
+castilla_bot/__init__.py
+castilla_bot/bot.py
+castilla_bot/cli.py
+castilla_bot/storage.py
+castilla_bot/whatsapp.py
+castilla_idiomas_bot.egg-info/PKG-INFO
+castilla_idiomas_bot.egg-info/SOURCES.txt
+castilla_idiomas_bot.egg-info/dependency_links.txt
+castilla_idiomas_bot.egg-info/entry_points.txt
+castilla_idiomas_bot.egg-info/requires.txt
+castilla_idiomas_bot.egg-info/top_level.txt
+tests/test_bot.py
+tests/test_whatsapp.py

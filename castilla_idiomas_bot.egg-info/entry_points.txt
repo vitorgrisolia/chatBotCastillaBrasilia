@@ -1,0 +1,2 @@
+[console_scripts]
+castilla-bot = castilla_bot.cli:main

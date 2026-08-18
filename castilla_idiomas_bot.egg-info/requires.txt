@@ -1,0 +1,6 @@
+Flask<4,>=3.0
+python-dotenv<2,>=1.0
+requests<3,>=2.31
+
+[:sys_platform != "win32"]
+gunicorn<24,>=22

@@ -1,0 +1,9 @@
+Metadata-Version: 2.4
+Name: castilla-idiomas-bot
+Version: 0.1.0
+Summary: Fluxo de atendimento do Castilla Idiomas Brasília
+Requires-Python: >=3.10
+Requires-Dist: Flask<4,>=3.0
+Requires-Dist: gunicorn<24,>=22; sys_platform != "win32"
+Requires-Dist: python-dotenv<2,>=1.0
+Requires-Dist: requests<3,>=2.31
