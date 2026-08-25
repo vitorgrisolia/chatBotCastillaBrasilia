@@ -226,7 +226,7 @@ class CastillaBot:
 
 Plano escolhido: {plan}
 
-Seus dados foram registrados. Um atendente entrará em contato pelo WhatsApp informado para finalizar seu cadastro e confirmar a matrícula.
+Seus dados foram registrados. Um atendente entrará em contato pelo WhatsApp ou telefone informado para finalizar seu cadastro e confirmar a matrícula.
 
 Obrigado por escolher o Castilla Idiomas Brasília! 📚✨"""
 
