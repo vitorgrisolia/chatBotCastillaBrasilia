@@ -23,8 +23,8 @@ python -m unittest discover -s tests -v
 
 ## Dados gerados
 
-As solicitações são gravadas em `data/atendimentos.jsonl` e as matrículas em
-`data/matriculas.jsonl`. Cada linha é um registro JSON independente.
+As solicitações são gravadas em `data/atendimentos.jsonl` e as pré-matrículas
+em `data/pre_matriculas.jsonl`. Cada linha é um registro JSON independente.
 
 ## Integração com outros canais
 

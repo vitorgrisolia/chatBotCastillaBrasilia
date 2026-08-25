@@ -15,7 +15,7 @@ Como podemos ajudar?
 1️⃣ Conhecer o curso
 2️⃣ Ver nossa metodologia
 3️⃣ Consultar planos e valores
-4️⃣ Fazer minha matrícula
+4️⃣ Fazer minha pré-matrícula
 5️⃣ Já sou aluno
 6️⃣ Falar com um atendente
 
@@ -29,7 +29,7 @@ Não trabalhamos com videoaulas gravadas.
 
 1️⃣ Conhecer a metodologia
 2️⃣ Ver planos e valores
-3️⃣ Fazer matrícula
+3️⃣ Fazer pré-matrícula
 0️⃣ Voltar ao menu"""
 
 METHODOLOGY = """Nossa metodologia possui três tipos de aula:
@@ -43,7 +43,7 @@ Os exercícios ajudam a reforçar o aprendizado e permitem que o aluno avance pa
 Todas as aulas são on-line e ao vivo com professores.
 
 1️⃣ Ver planos e valores
-2️⃣ Fazer matrícula
+2️⃣ Fazer pré-matrícula
 0️⃣ Voltar ao menu"""
 
 PLANS = """📚 Conheça nossos planos:
@@ -71,11 +71,11 @@ Todos os planos incluem:
 ✅ Material didático digital
 ✅ Suporte durante o aprendizado
 
-1️⃣ Quero fazer minha matrícula
+1️⃣ Quero fazer minha pré-matrícula
 2️⃣ Falar com um atendente
 0️⃣ Voltar ao menu"""
 
-PLAN_SELECTION = """🎓 Ótimo! Vamos iniciar sua matrícula.
+PLAN_SELECTION = """🎓 Ótimo! Vamos iniciar sua pré-matrícula.
 
 Primeiro, informe o plano escolhido:
 
@@ -97,12 +97,6 @@ INVALID = """Não consegui identificar a opção escolhida. 😕
 
 Digite MENU para visualizar as opções ou ATENDENTE para falar com nossa equipe."""
 
-ENROLLMENT_DONE = """✅ Recebemos suas informações!
-
-Nossa equipe verificará os dados e entrará em contato para concluir sua matrícula.
-
-Obrigado por escolher o Castilla Idiomas Brasília! 📚✨"""
-
 HUMAN_DONE = """Aguarde um momento. Um de nossos atendentes continuará o atendimento assim que estiver disponível."""
 
 PLANS_BY_OPTION = {
@@ -112,29 +106,12 @@ PLANS_BY_OPTION = {
     "4": "Top — R$ 397,00/mês",
 }
 
-ENROLLMENT_FIELDS = [
-    ("nome_completo", "Nome completo do aluno"),
-    ("data_nascimento", "Data de nascimento"),
-    ("sexo", "Sexo"),
-    ("cpf", "CPF"),
-    ("rg", "RG"),
-    ("data_emissao_rg", "Data de emissão do RG"),
-    ("orgao_emissor", "Órgão emissor"),
-    ("cep", "CEP"),
-    ("rua", "Rua"),
-    ("numero", "Número"),
-    ("complemento", "Complemento (digite NÃO se não houver)"),
-    ("bairro", "Bairro"),
-    ("cidade", "Cidade"),
-    ("whatsapp", "WhatsApp"),
-    ("celular", "Celular"),
-    ("telefone", "Telefone (digite NÃO se não houver)"),
+PRE_ENROLLMENT_FIELDS = [
+    ("nome_completo", "Nome completo"),
+    ("endereco", "Endereço completo"),
     ("email", "E-mail"),
-    ("responsavel_nome", "Nome completo do responsável financeiro"),
-    ("responsavel_cpf", "CPF do responsável financeiro"),
-    ("responsavel_telefone", "Telefone/WhatsApp do responsável financeiro"),
-    ("responsavel_email", "E-mail do responsável financeiro"),
-    ("tipo_horario", "Deseja aulas em horário REGULAR ou FLEXÍVEL?"),
+    ("cpf", "CPF"),
+    ("whatsapp", "WhatsApp"),
 ]
 
 STUDENT_SUBJECTS = {
@@ -183,7 +160,7 @@ class CastillaBot:
             "methodology": self._methodology,
             "plans": self._plans,
             "plan_selection": self._plan_selection,
-            "enrollment": self._enrollment,
+            "pre_enrollment": self._pre_enrollment,
             "student": self._student,
             "human_name": self._human_name,
             "human_subject": self._human_subject,
@@ -229,22 +206,29 @@ class CastillaBot:
     def _plan_selection(self, session: Session, answer: str) -> str:
         if answer not in PLANS_BY_OPTION:
             return INVALID
-        session.state = "enrollment"
+        session.state = "pre_enrollment"
         session.field_index = 0
         session.data = {"plano": PLANS_BY_OPTION[answer]}
         return self._field_prompt(session)
 
-    def _enrollment(self, session: Session, answer: str) -> str:
-        key, _ = ENROLLMENT_FIELDS[session.field_index]
+    def _pre_enrollment(self, session: Session, answer: str) -> str:
+        key, _ = PRE_ENROLLMENT_FIELDS[session.field_index]
         session.data[key] = answer
         session.field_index += 1
-        if session.field_index < len(ENROLLMENT_FIELDS):
+        if session.field_index < len(PRE_ENROLLMENT_FIELDS):
             return self._field_prompt(session)
 
         record = self._record(session.data)
-        self.storage.save("matriculas", record)
+        self.storage.save("pre_matriculas", record)
         session.state = "finished"
-        return ENROLLMENT_DONE
+        plan = session.data["plano"]
+        return f"""✅ Pré-matrícula recebida!
+
+Plano escolhido: {plan}
+
+Seus dados foram registrados. Um atendente entrará em contato pelo WhatsApp informado para finalizar seu cadastro e confirmar a matrícula.
+
+Obrigado por escolher o Castilla Idiomas Brasília! 📚✨"""
 
     def _student(self, session: Session, answer: str) -> str:
         if answer == "0":
@@ -296,10 +280,10 @@ class CastillaBot:
 
     @staticmethod
     def _field_prompt(session: Session) -> str:
-        _, label = ENROLLMENT_FIELDS[session.field_index]
+        _, label = PRE_ENROLLMENT_FIELDS[session.field_index]
         current = session.field_index + 1
-        total = len(ENROLLMENT_FIELDS)
-        return f"Dados para matrícula ({current}/{total})\n{label}:"
+        total = len(PRE_ENROLLMENT_FIELDS)
+        return f"Dados para pré-matrícula ({current}/{total})\n{label}:"
 
     @staticmethod
     def _record(data: dict[str, Any]) -> dict[str, Any]:
@@ -307,4 +291,3 @@ class CastillaBot:
             **data,
             "recebido_em": datetime.now(timezone.utc).isoformat(),
         }
-
