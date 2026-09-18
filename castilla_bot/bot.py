@@ -9,28 +9,25 @@ from typing import Any
 from .storage import JsonlStorage
 
 
+MAIN_OPTIONS = {
+    "1": "1️⃣ Conhecer o curso",
+    "2": "2️⃣ Ver nossa metodologia",
+    "3": "3️⃣ Consultar planos e valores",
+    "4": "4️⃣ Fazer minha pré-matrícula",
+    "5": "5️⃣ Já sou aluno",
+    "6": "6️⃣ Falar com um atendente",
+}
+
 WELCOME = """Olá! 👋 Seja bem-vindo ao Castilla Idiomas Brasília!
 Como podemos ajudar?
 
-1️⃣ Conhecer o curso
-2️⃣ Ver nossa metodologia
-3️⃣ Consultar planos e valores
-4️⃣ Fazer minha pré-matrícula
-5️⃣ Já sou aluno
-6️⃣ Falar com um atendente
-
-Digite o número da opção desejada."""
+""" + "\n".join(MAIN_OPTIONS.values()) + "\n\nDigite o número da opção desejada."
 
 COURSE = """📚 Nosso curso de inglês é 100% on-line, com aulas ao vivo e direto com o professor.
 
 O curso vai do básico ao avançado em aproximadamente 20 meses. Você terá acesso à Plataforma Castilla Online e poderá agendar suas aulas entre 7h e 21h.
 
-Não trabalhamos com videoaulas gravadas.
-
-1️⃣ Conhecer a metodologia
-2️⃣ Ver planos e valores
-3️⃣ Fazer pré-matrícula
-0️⃣ Voltar ao menu"""
+Não trabalhamos com videoaulas gravadas."""
 
 METHODOLOGY = """Nossa metodologia possui três tipos de aula:
 
@@ -40,11 +37,7 @@ METHODOLOGY = """Nossa metodologia possui três tipos de aula:
 
 Os exercícios ajudam a reforçar o aprendizado e permitem que o aluno avance para o próximo capítulo.
 
-Todas as aulas são on-line e ao vivo com professores.
-
-1️⃣ Ver planos e valores
-2️⃣ Fazer pré-matrícula
-0️⃣ Voltar ao menu"""
+Todas as aulas são on-line e ao vivo com professores."""
 
 PLANS = """📚 Conheça nossos planos:
 
@@ -69,11 +62,7 @@ Todos os planos incluem:
 ✅ Aulas 100% ao vivo
 ✅ Plataforma para agendamento
 ✅ Material didático digital
-✅ Suporte durante o aprendizado
-
-1️⃣ Quero fazer minha pré-matrícula
-2️⃣ Falar com um atendente
-0️⃣ Voltar ao menu"""
+✅ Suporte durante o aprendizado"""
 
 PLAN_SELECTION = """🎓 Ótimo! Vamos iniciar sua pré-matrícula.
 
@@ -95,9 +84,9 @@ STUDENT_MENU = """Olá! Como podemos ajudar?
 
 INVALID = """Não consegui identificar a opção escolhida. 😕
 
-Digite MENU para visualizar as opções ou ATENDENTE para falar com nossa equipe."""
+Digite MENU para visualizar as opções restantes ou ATENDENTE para falar com nossa equipe."""
 
-HUMAN_DONE = """Aguarde um momento. Um de nossos atendentes continuará o atendimento assim que estiver disponível."""
+HUMAN_DONE = """✅ Solicitação recebida. Aguarde um momento: um de nossos atendentes continuará a conversa por aqui assim que estiver disponível."""
 
 PLANS_BY_OPTION = {
     "1": "Conversação — R$ 147,00/mês",
@@ -128,6 +117,7 @@ class Session:
     state: str = "main"
     data: dict[str, Any] = field(default_factory=dict)
     field_index: int = 0
+    selected_options: set[str] = field(default_factory=set)
 
 
 class CastillaBot:
@@ -141,67 +131,68 @@ class CastillaBot:
         self.sessions[session_id] = Session()
         return WELCOME
 
-    def handle(self, session_id: str, message: str) -> str:
+    def handle(self, session_id: str, message: str) -> str | None:
         session = self.sessions.setdefault(session_id, Session())
+        # Durante o atendimento humano, nem comandos do cliente reativam o bot.
+        if session.state == "human_pending":
+            return None
         answer = message.strip()
         normalized = answer.casefold()
 
+        if normalized == "reiniciar":
+            return self.start(session_id)
         if normalized == "menu":
-            self.sessions[session_id] = Session()
-            return WELCOME
+            session.state = "main"
+            session.data = {}
+            session.field_index = 0
+            return self._remaining_menu(session)
         if normalized == "atendente":
+            session.selected_options.add("6")
             return self._start_human(session)
         if not answer:
             return INVALID
 
         handlers = {
             "main": self._main,
-            "course": self._course,
-            "methodology": self._methodology,
-            "plans": self._plans,
             "plan_selection": self._plan_selection,
             "pre_enrollment": self._pre_enrollment,
             "student": self._student,
             "human_name": self._human_name,
             "human_subject": self._human_subject,
-            "finished": self._finished,
         }
         return handlers[session.state](session, answer)
 
+    def attendant_message(self, session_id: str, message: str) -> bool:
+        """Reativa o bot somente após o encerramento enviado pelo atendente."""
+        session = self.sessions.get(session_id)
+        if (
+            session is None
+            or session.state != "human_pending"
+            or message.strip().casefold() != "atendimento finalizado"
+        ):
+            return False
+        session.state = "main"
+        session.data = {}
+        session.field_index = 0
+        return True
+
     def _main(self, session: Session, answer: str) -> str:
-        routes = {
-            "1": ("course", COURSE),
-            "2": ("methodology", METHODOLOGY),
-            "3": ("plans", PLANS),
-            "4": ("plan_selection", PLAN_SELECTION),
-            "5": ("student", STUDENT_MENU),
-        }
+        if answer in session.selected_options:
+            return "Você já selecionou essa opção.\n\n" + self._remaining_menu(session)
+        information = {"1": COURSE, "2": METHODOLOGY, "3": PLANS}
+        if answer in information:
+            session.selected_options.add(answer)
+            return information[answer] + "\n\n" + self._remaining_menu(session)
+        if answer == "4":
+            session.state = "plan_selection"
+            return PLAN_SELECTION + "\n\nDigite MENU para voltar às opções restantes."
+        if answer == "5":
+            session.state = "student"
+            return STUDENT_MENU
         if answer == "6":
+            session.selected_options.add(answer)
             return self._start_human(session)
-        return self._route(session, answer, routes)
-
-    def _course(self, session: Session, answer: str) -> str:
-        return self._route(session, answer, {
-            "1": ("methodology", METHODOLOGY),
-            "2": ("plans", PLANS),
-            "3": ("plan_selection", PLAN_SELECTION),
-            "0": ("main", WELCOME),
-        })
-
-    def _methodology(self, session: Session, answer: str) -> str:
-        return self._route(session, answer, {
-            "1": ("plans", PLANS),
-            "2": ("plan_selection", PLAN_SELECTION),
-            "0": ("main", WELCOME),
-        })
-
-    def _plans(self, session: Session, answer: str) -> str:
-        if answer == "2":
-            return self._start_human(session)
-        return self._route(session, answer, {
-            "1": ("plan_selection", PLAN_SELECTION),
-            "0": ("main", WELCOME),
-        })
+        return INVALID + "\n\n" + self._remaining_menu(session)
 
     def _plan_selection(self, session: Session, answer: str) -> str:
         if answer not in PLANS_BY_OPTION:
@@ -220,7 +211,8 @@ class CastillaBot:
 
         record = self._record(session.data)
         self.storage.save("pre_matriculas", record)
-        session.state = "finished"
+        session.selected_options.add("4")
+        session.state = "main"
         plan = session.data["plano"]
         return f"""✅ Pré-matrícula recebida!
 
@@ -228,14 +220,17 @@ Plano escolhido: {plan}
 
 Seus dados foram registrados. Um atendente entrará em contato pelo WhatsApp ou telefone informado para finalizar seu cadastro e confirmar a matrícula.
 
-Obrigado por escolher o Castilla Idiomas Brasília! 📚✨"""
+Obrigado por escolher o Castilla Idiomas Brasília! 📚✨
+
+{self._remaining_menu(session)}"""
 
     def _student(self, session: Session, answer: str) -> str:
         if answer == "0":
             session.state = "main"
-            return WELCOME
+            return self._remaining_menu(session)
         if answer not in STUDENT_SUBJECTS:
             return INVALID
+        session.selected_options.add("5")
         session.data = {"assunto": STUDENT_SUBJECTS[answer]}
         session.state = "human_name"
         return "👩‍💼 Certo! Para encaminhar seu atendimento, informe seu nome:"
@@ -258,25 +253,22 @@ Obrigado por escolher o Castilla Idiomas Brasília! 📚✨"""
 
     def _save_human(self, session: Session) -> str:
         self.storage.save("atendimentos", self._record(session.data))
-        session.state = "finished"
+        session.state = "human_pending"
         return HUMAN_DONE
 
     @staticmethod
-    def _finished(session: Session, answer: str) -> str:
-        del session, answer
-        return "Atendimento finalizado. Digite MENU para iniciar uma nova conversa."
-
-    @staticmethod
-    def _route(
-        session: Session,
-        answer: str,
-        routes: dict[str, tuple[str, str]],
-    ) -> str:
-        destination = routes.get(answer)
-        if destination is None:
-            return INVALID
-        session.state, response = destination
-        return response
+    def _remaining_menu(session: Session) -> str:
+        remaining = [
+            label for option, label in MAIN_OPTIONS.items()
+            if option not in session.selected_options
+        ]
+        if not remaining:
+            return "Todas as opções foram selecionadas. Digite REINICIAR para começar de novo."
+        return (
+            "Outras opções disponíveis:\n\n"
+            + "\n".join(remaining)
+            + "\n\nDigite o número desejado ou REINICIAR para começar de novo."
+        )
 
     @staticmethod
     def _field_prompt(session: Session) -> str:

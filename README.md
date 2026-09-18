@@ -14,6 +14,7 @@ stable customer ID and exchanging text messages.
 ## Project highlights
 
 - Rule-based conversation flow implemented as a finite-state machine.
+- Main-menu options disappear after selection; unselected options remain visible with their original numbers.
 - Separate sessions for multiple concurrent customers.
 - Course, methodology, pricing, student support, and human handoff flows.
 - Pre-enrollment collection with the selected plan and price.
@@ -27,11 +28,8 @@ stable customer ID and exchanging text messages.
 ## Conversation flow
 
 ```text
-Welcome menu
+Welcome menu (remaining options after each selection)
 ├── Course information
-│   ├── Methodology
-│   ├── Plans and pricing
-│   └── Pre-enrollment
 ├── Methodology
 ├── Plans and pricing
 ├── Pre-enrollment
@@ -54,7 +52,8 @@ will contact them to complete the enrollment.
 
 - the current conversation state;
 - the data already collected;
-- the index of the next requested field.
+- the index of the next requested field;
+- the main-menu options already selected.
 
 The active state selects the appropriate handler for each incoming message. The
 handler validates the menu option, updates the session, and returns the next
@@ -65,6 +64,19 @@ For WhatsApp, Meta sends events to the Flask webhook. The application verifies
 the request signature, extracts incoming text messages, uses the sender's phone
 number as the session identifier, runs the conversational core, and sends the
 reply through the Graph API.
+
+After handoff, the bot sends one confirmation and stays silent, including for
+`MENU` and `REINICIAR`. If the school's number uses WhatsApp Business App and
+Cloud API coexistence and subscribes to `smb_message_echoes`, the attendant can
+write `atendimento finalizado` in that customer's WhatsApp conversation. The
+webhook receives the business-app message echo and resumes the bot. A customer
+sending the same phrase cannot release it. Without coexistence and that event,
+messages typed in the app do not reach this webhook; an attendant interface
+would need to use the protected `POST /operator/complete` endpoint instead.
+
+`MENU` shows only the remaining options. `REINICIAR` starts a fresh conversation
+with all options available again. A pre-enrollment option is removed only after
+the customer completes the form; cancelling it with `MENU` keeps it available.
 
 ## Technology stack
 
@@ -174,6 +186,7 @@ WHATSAPP_ACCESS_TOKEN=your-meta-access-token
 WHATSAPP_PHONE_NUMBER_ID=your-whatsapp-phone-number-id
 META_APP_SECRET=your-meta-application-secret
 META_GRAPH_API_VERSION=v23.0
+OPERATOR_TOKEN=create-a-long-random-secret-here
 ```
 
 Never commit the populated `.env` file or expose its values in screenshots,
@@ -188,6 +201,28 @@ python -m castilla_bot.whatsapp
 The default port is `8000`. It can be changed through the `PORT` environment
 variable. `GET /` is the health endpoint, while `GET /webhook` and
 `POST /webhook` verify and receive Meta events.
+
+To close service from WhatsApp Business itself, set up App/Cloud API
+coexistence and subscribe the webhook to `smb_message_echoes`. The attendant
+must send the phrase in the customer's conversation from the school's number.
+The bot sends no reply on completion; it waits for the customer's next message.
+Verify that Meta delivers this event for your account before relying on it.
+
+As an alternative for an integrated attendant interface, call
+`POST /operator/complete` with `Authorization: Bearer <OPERATOR_TOKEN>` and this
+JSON body:
+
+```json
+{"customer_phone":"5561999999999","message":"atendimento finalizado"}
+```
+
+The phone number must match the identifier received by the webhook. This route
+does not message the customer; it only resumes the bot for the next customer
+message. Without `OPERATOR_TOKEN`, the route is disabled.
+
+Sessions are still in memory: run a single bot process (as configured in the
+Dockerfile). Restarting the service clears pending handoffs. Production setups
+with multiple processes will need shared, persistent session storage.
 
 ## Expose the local webhook with Cloudflare Tunnel
 

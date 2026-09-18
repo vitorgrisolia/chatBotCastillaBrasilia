@@ -28,7 +28,9 @@ def main() -> None:
         if message.strip().casefold() in {"sair", "exit"}:
             print("Conversa encerrada.")
             break
-        print("\nBOT:\n" + bot.handle(session_id, message))
+        reply = bot.handle(session_id, message)
+        if reply is not None:
+            print("\nBOT:\n" + reply)
 
 
 if __name__ == "__main__":

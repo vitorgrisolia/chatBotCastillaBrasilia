@@ -15,6 +15,7 @@ identificação estável do cliente e trocar mensagens de texto.
 ## Destaques do projeto
 
 - Fluxo de conversação baseado em regras e implementado como máquina de estados.
+- Opções do menu principal desaparecem após serem selecionadas; as demais continuam disponíveis com a mesma numeração.
 - Sessões separadas para vários clientes simultâneos.
 - Fluxos de curso, metodologia, planos, suporte ao aluno e atendimento humano.
 - Coleta de pré-matrícula com o plano e o valor escolhidos.
@@ -28,11 +29,8 @@ identificação estável do cliente e trocar mensagens de texto.
 ## Fluxo de atendimento
 
 ```text
-Menu de boas-vindas
+Menu de boas-vindas (opções restantes após cada consulta)
 ├── Informações sobre o curso
-│   ├── Metodologia
-│   ├── Planos e valores
-│   └── Pré-matrícula
 ├── Metodologia
 ├── Planos e valores
 ├── Pré-matrícula
@@ -54,7 +52,8 @@ um `session_id`, associado a uma `Session` mantida em memória com:
 
 - a etapa atual da conversa;
 - os dados já coletados;
-- a posição do próximo campo a ser solicitado.
+- a posição do próximo campo a ser solicitado;
+- as opções do menu principal já selecionadas.
 
 O estado atual seleciona a função responsável por tratar cada nova mensagem.
 Essa função valida a opção, atualiza a sessão e devolve a próxima resposta. Ao
@@ -65,6 +64,16 @@ No WhatsApp, a Meta envia eventos ao webhook Flask. A aplicação verifica a
 assinatura da requisição, extrai as mensagens de texto, utiliza o telefone do
 remetente como identificador da sessão, executa o núcleo de conversação e envia
 a resposta pela Graph API.
+
+Após encaminhar o cliente a um atendente, o bot envia uma única confirmação e
+permanece em silêncio, inclusive para `MENU` e `REINICIAR`. Se o número da
+escola usa a coexistência do WhatsApp Business com a Cloud API e está inscrito
+no evento `smb_message_echoes`, o atendente pode escrever `atendimento
+finalizado` na própria conversa do cliente no WhatsApp Business. O webhook
+recebe a cópia da mensagem enviada pela escola e reativa o bot. A mesma frase
+enviada pelo cliente não libera o bot. Sem coexistência e sem esse evento, a
+mensagem escrita no aplicativo não chega ao webhook; nesse caso, é necessária
+uma interface integrada à rota protegida `POST /operator/complete`.
 
 ## Tecnologias utilizadas
 
@@ -128,8 +137,11 @@ Inicie a demonstração no terminal:
 python -m castilla_bot.cli
 ```
 
-Durante a demonstração, digite `MENU` para voltar ao início, `ATENDENTE` para
-solicitar atendimento humano ou `SAIR` para encerrar a aplicação.
+Durante a demonstração, digite `MENU` para ver as opções ainda não selecionadas,
+`REINICIAR` para começar uma nova conversa, `ATENDENTE` para solicitar atendimento
+humano ou `SAIR` para encerrar a aplicação. A numeração permanece fixa; uma opção
+de pré-matrícula só desaparece após o envio dos dados. Se o usuário voltar ao
+menu antes de concluir, ela continua disponível.
 
 ## Executar os testes
 
@@ -175,6 +187,7 @@ WHATSAPP_ACCESS_TOKEN=seu-token-de-acesso-da-meta
 WHATSAPP_PHONE_NUMBER_ID=id-do-numero-do-whatsapp
 META_APP_SECRET=chave-secreta-do-aplicativo-meta
 META_GRAPH_API_VERSION=v23.0
+OPERATOR_TOKEN=crie-um-token-longo-e-aleatorio-aqui
 ```
 
 Nunca envie o `.env` preenchido ao Git nem exponha seus valores em capturas de
@@ -189,6 +202,30 @@ python -m castilla_bot.whatsapp
 A porta padrão é `8000` e pode ser alterada pela variável `PORT`. A rota
 `GET /` verifica a saúde do serviço; `GET /webhook` e `POST /webhook` verificam
 e recebem os eventos da Meta.
+
+Para encerrar pelo próprio WhatsApp Business, configure a coexistência da conta
+com a Cloud API e inscreva o webhook no campo `smb_message_echoes`. A frase
+deve ser enviada na conversa com o cliente, pelo número da escola. O bot não
+envia nenhuma resposta no momento do encerramento; ele aguarda a próxima
+mensagem do cliente. Confirme que a Meta entrega esse evento na sua conta antes
+de depender desse fluxo.
+
+Como alternativa para uma interface de atendimento integrada, use
+`POST /operator/complete` com o cabeçalho
+`Authorization: Bearer <OPERATOR_TOKEN>` e este corpo JSON:
+
+```json
+{"customer_phone":"5561999999999","message":"atendimento finalizado"}
+```
+
+O telefone precisa ser o mesmo identificador recebido no webhook. A rota não
+envia mensagem ao cliente; ela apenas reativa o bot para a próxima mensagem.
+Sem `OPERATOR_TOKEN`, a rota fica desativada.
+
+As sessões ainda ficam na memória: use um único processo do bot (o Dockerfile
+já está configurado assim). Reiniciar o serviço apaga o estado dos atendimentos
+em andamento; antes de operar em produção com múltiplos processos, será
+necessário persistir as sessões em um armazenamento compartilhado.
 
 ## Publicar o webhook local com Cloudflare Tunnel
 

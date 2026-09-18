@@ -7,5 +7,4 @@ RUN pip install --no-cache-dir .
 
 ENV PORT=8000
 EXPOSE 8000
-CMD ["sh", "-c", "gunicorn --workers 2 --bind 0.0.0.0:${PORT} 'castilla_bot.whatsapp:create_app()'"]
-
+CMD ["sh", "-c", "gunicorn --workers 1 --bind 0.0.0.0:${PORT} 'castilla_bot.whatsapp:create_app()'"]

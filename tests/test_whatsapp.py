@@ -2,8 +2,10 @@ import unittest
 import hashlib
 import hmac
 import json
+import tempfile
 
 from castilla_bot.bot import CastillaBot
+from castilla_bot.storage import JsonlStorage
 from castilla_bot.whatsapp import create_app
 
 
@@ -17,13 +19,18 @@ class FakeWhatsAppClient:
 
 class WhatsAppWebhookTests(unittest.TestCase):
     def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
         self.sender = FakeWhatsAppClient()
         self.app = create_app(
-            bot=CastillaBot(),
+            bot=CastillaBot(JsonlStorage(self.temp_dir.name)),
             client=self.sender,
             verify_token="segredo-de-teste",
             app_secret="app-secret-de-teste",
+            operator_token="token-do-atendente",
         ).test_client()
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
 
     def test_meta_verification(self):
         response = self.app.get(
@@ -46,6 +53,79 @@ class WhatsAppWebhookTests(unittest.TestCase):
         self.assertIn("Seja bem-vindo", self.sender.sent[0][1])
         self.assertIn("Conheça nossos planos", self.sender.sent[1][1])
 
+    def test_whatsapp_reply_keeps_only_unselected_options(self):
+        self._post_signed(self._message_payload("Olá"))
+        self._post_signed(self._message_payload("1"))
+        course_reply = self.sender.sent[-1][1]
+        self.assertNotIn("1️⃣ Conhecer o curso", course_reply)
+        self.assertIn("2️⃣ Ver nossa metodologia", course_reply)
+
+        self._post_signed(self._message_payload("2"))
+        methodology_reply = self.sender.sent[-1][1]
+        self.assertNotIn("1️⃣ Conhecer o curso", methodology_reply)
+        self.assertNotIn("2️⃣ Ver nossa metodologia", methodology_reply)
+        self.assertIn("3️⃣ Consultar planos e valores", methodology_reply)
+
+    def test_human_handoff_stops_whatsapp_replies_until_operator_completes(self):
+        for message in ("Olá", "6", "Maria", "Quero tirar uma dúvida"):
+            self.assertEqual(self._post_signed(self._message_payload(message)).status_code, 200)
+        self.assertIn("Aguarde um momento", self.sender.sent[-1][1])
+        sent_count = len(self.sender.sent)
+
+        for message in ("Olá?", "MENU", "REINICIAR", "atendimento finalizado"):
+            self.assertEqual(self._post_signed(self._message_payload(message)).status_code, 200)
+        self.assertEqual(len(self.sender.sent), sent_count)
+
+        unauthorized = self.app.post(
+            "/operator/complete",
+            json={"customer_phone": "5561999999999", "message": "atendimento finalizado"},
+        )
+        self.assertEqual(unauthorized.status_code, 401)
+        self.assertEqual(len(self.sender.sent), sent_count)
+
+        invalid_phrase = self.app.post(
+            "/operator/complete",
+            json={"customer_phone": "5561999999999", "message": "voltar"},
+            headers={"Authorization": "Bearer token-do-atendente"},
+        )
+        self.assertEqual(invalid_phrase.status_code, 400)
+
+        completed = self.app.post(
+            "/operator/complete",
+            json={"customer_phone": "5561999999999", "message": "atendimento finalizado"},
+            headers={"Authorization": "Bearer token-do-atendente"},
+        )
+        self.assertEqual(completed.status_code, 200)
+        self.assertEqual(len(self.sender.sent), sent_count)
+        self._post_signed(self._message_payload("MENU"))
+        self.assertEqual(len(self.sender.sent), sent_count + 1)
+        self.assertIn("Outras opções disponíveis", self.sender.sent[-1][1])
+
+    def test_attendant_can_complete_from_whatsapp_business_app_echo(self):
+        for message in ("Olá", "6", "Maria", "Quero tirar uma dúvida"):
+            self._post_signed(self._message_payload(message))
+        sent_count = len(self.sender.sent)
+
+        self._post_signed(self._business_app_echo_payload("Ainda estou atendendo"))
+        self._post_signed(self._message_payload("MENU"))
+        self.assertEqual(len(self.sender.sent), sent_count)
+
+        self._post_signed(self._business_app_echo_payload(" Atendimento Finalizado "))
+        self.assertEqual(len(self.sender.sent), sent_count)
+        self._post_signed(self._message_payload("MENU"))
+        self.assertEqual(len(self.sender.sent), sent_count + 1)
+        self.assertIn("Outras opções disponíveis", self.sender.sent[-1][1])
+
+    def test_api_message_echo_does_not_complete_human_service(self):
+        for message in ("Olá", "6", "Maria", "Quero tirar uma dúvida"):
+            self._post_signed(self._message_payload(message))
+        sent_count = len(self.sender.sent)
+        echo = self._business_app_echo_payload("atendimento finalizado")
+        echo["entry"][0]["changes"][0]["field"] = "message_echoes"
+        self._post_signed(echo)
+        self._post_signed(self._message_payload("MENU"))
+        self.assertEqual(len(self.sender.sent), sent_count)
+
     def test_status_event_is_ignored(self):
         response = self._post_signed(
             {"entry": [{"changes": [{"value": {"statuses": [{}]}}]}]}
@@ -56,6 +136,18 @@ class WhatsAppWebhookTests(unittest.TestCase):
     def test_unsigned_event_is_rejected(self):
         response = self.app.post("/webhook", json=self._message_payload("Olá"))
         self.assertEqual(response.status_code, 401)
+
+    def test_operator_route_is_disabled_without_token(self):
+        app = create_app(
+            bot=CastillaBot(JsonlStorage(self.temp_dir.name)),
+            client=FakeWhatsAppClient(),
+            operator_token="",
+        ).test_client()
+        response = app.post(
+            "/operator/complete",
+            json={"customer_phone": "5561999999999", "message": "atendimento finalizado"},
+        )
+        self.assertEqual(response.status_code, 404)
 
     @staticmethod
     def _message_payload(text):
@@ -73,6 +165,30 @@ class WhatsAppWebhookTests(unittest.TestCase):
                                     }
                                 ]
                             }
+                        }
+                    ]
+                }
+            ]
+        }
+
+    @staticmethod
+    def _business_app_echo_payload(text):
+        return {
+            "entry": [
+                {
+                    "changes": [
+                        {
+                            "field": "smb_message_echoes",
+                            "value": {
+                                "message_echoes": [
+                                    {
+                                        "from": "5561888888888",
+                                        "to": "5561999999999",
+                                        "type": "text",
+                                        "text": {"body": text},
+                                    }
+                                ]
+                            },
                         }
                     ]
                 }

@@ -60,11 +60,15 @@ def create_app(
     client: WhatsAppClient | None = None,
     verify_token: str | None = None,
     app_secret: str | None = None,
+    operator_token: str | None = None,
 ) -> Flask:
     """Cria a aplicação Flask; parâmetros opcionais facilitam os testes."""
 
     app = Flask(__name__)
     chatbot = bot or CastillaBot()
+    configured_operator_token = (
+        os.getenv("OPERATOR_TOKEN", "") if operator_token is None else operator_token
+    )
     if client is None:
         environment = _configuration_from_environment()
         configured_verify_token = verify_token or environment["WHATSAPP_VERIFY_TOKEN"]
@@ -101,6 +105,10 @@ def create_app(
         ):
             return jsonify({"error": "invalid signature"}), 401
         payload = request.get_json(silent=True) or {}
+        # Em contas com coexistência, a Meta envia as mensagens digitadas no
+        # WhatsApp Business da escola em um evento distinto das do cliente.
+        for outgoing in _business_app_message_echoes(payload):
+            chatbot.attendant_message(outgoing["to"], outgoing["text"]["body"])
         # A Meta pode agrupar mais de uma entrada/alteração/mensagem no evento.
         for incoming in _text_messages(payload):
             sender = incoming["from"]
@@ -110,9 +118,31 @@ def create_app(
                 # A primeira mensagem do usuário inicia a sessão e recebe o menu.
             else:
                 reply = chatbot.handle(sender, message)
-            whatsapp_client.send_text(sender, reply)
+            if reply is not None:
+                whatsapp_client.send_text(sender, reply)
         # O recebimento deve ser confirmado mesmo quando o evento é só um status.
         return jsonify({"status": "received"}), 200
+
+    @app.post("/operator/complete")
+    def complete_human_service() -> tuple[Response, int]:
+        # O webhook de mensagens do cliente não identifica falas do atendente.
+        # Uma interface de atendimento pode chamar esta rota com um token próprio.
+        if not configured_operator_token:
+            return jsonify({"error": "not found"}), 404
+        authorization = request.headers.get("Authorization", "")
+        expected = f"Bearer {configured_operator_token}"
+        if not hmac.compare_digest(authorization, expected):
+            return jsonify({"error": "unauthorized"}), 401
+        payload = request.get_json(silent=True) or {}
+        session_id = payload.get("customer_phone")
+        message = payload.get("message")
+        if not isinstance(session_id, str) or not isinstance(message, str):
+            return jsonify({"error": "customer_phone and message are required"}), 400
+        if message.strip().casefold() != "atendimento finalizado":
+            return jsonify({"error": "invalid completion phrase"}), 400
+        if not chatbot.attendant_message(session_id, message):
+            return jsonify({"error": "human service not pending"}), 409
+        return jsonify({"status": "completed"}), 200
 
     return app
 
@@ -139,11 +169,32 @@ def _text_messages(payload: dict[str, Any]) -> list[dict[str, Any]]:
     messages: list[dict[str, Any]] = []
     for entry in payload.get("entry", []):
         for change in entry.get("changes", []):
+            if change.get("field") not in (None, "messages"):
+                continue
             value = change.get("value", {})
             for message in value.get("messages", []):
                 if message.get("type") == "text" and message.get("from"):
                     messages.append(message)
     return messages
+
+
+def _business_app_message_echoes(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Extrai mensagens enviadas pelo atendente no app WhatsApp Business."""
+    echoes: list[dict[str, Any]] = []
+    for entry in payload.get("entry", []):
+        for change in entry.get("changes", []):
+            if change.get("field") != "smb_message_echoes":
+                continue
+            value = change.get("value", {})
+            for echo in value.get("message_echoes", []):
+                if (
+                    echo.get("type") == "text"
+                    and isinstance(echo.get("to"), str)
+                    and isinstance(echo.get("text"), dict)
+                    and isinstance(echo["text"].get("body"), str)
+                ):
+                    echoes.append(echo)
+    return echoes
 
 
 def _valid_signature(body: bytes, received: str, app_secret: str) -> bool:
