@@ -89,7 +89,8 @@ class CastillaBotTests(unittest.TestCase):
         self.assertIn("Nome completo", first_prompt)
         response = ""
         for index in range(len(PRE_ENROLLMENT_FIELDS)):
-            response = self.bot.handle(self.session, f"resposta-{index}")
+            answer = "529.982.247-25" if PRE_ENROLLMENT_FIELDS[index][0] == "cpf" else f"resposta-{index}"
+            response = self.bot.handle(self.session, answer)
         self.assertIn("Pré-matrícula recebida", response)
         self.assertIn("Básico — R$ 197,00/mês", response)
         self.assertIn("Um atendente entrará em contato", response)
@@ -102,8 +103,18 @@ class CastillaBotTests(unittest.TestCase):
         self.assertEqual(record["nome_completo"], "resposta-0")
         self.assertEqual(record["endereco"], "resposta-1")
         self.assertEqual(record["email"], "resposta-2")
-        self.assertEqual(record["cpf"], "resposta-3")
+        self.assertEqual(record["cpf"], "52998224725")
         self.assertEqual(record["whatsapp"], "resposta-4")
+
+    def test_invalid_cpf_is_rejected_without_advancing(self):
+        self.bot.handle(self.session, "4")
+        self.bot.handle(self.session, "2")
+        for answer in ("Maria", "Rua Central", "maria@example.com"):
+            self.bot.handle(self.session, answer)
+        self.assertIn("CPF inválido", self.bot.handle(self.session, "111.111.111-11"))
+        self.assertIn("CPF inválido", self.bot.handle(self.session, "529.982.247-24"))
+        self.assertFalse((Path(self.temp_dir.name) / "pre_matriculas.jsonl").exists())
+        self.assertIn("WhatsApp", self.bot.handle(self.session, "529.982.247-25"))
 
 
 if __name__ == "__main__":

@@ -5,7 +5,11 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from threading import Lock
-from typing import Any
+from typing import Any, Protocol
+
+
+class RecordStorage(Protocol):
+    def save(self, collection: str, record: dict[str, Any]) -> str | None: ...
 
 
 class JsonlStorage:
@@ -21,4 +25,3 @@ class JsonlStorage:
         with self._lock, destination.open("a", encoding="utf-8") as file:
             json.dump(record, file, ensure_ascii=False)
             file.write("\n")
-

@@ -3,5 +3,7 @@ __pycache__/
 .venv/
 .env
 data/*.jsonl
+data/private/
+*.cbackup
 .tmp/
 .Apresentacao_CastillaBOT_Cliente

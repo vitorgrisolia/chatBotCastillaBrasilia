@@ -155,6 +155,12 @@ events, and the first-message behavior.
 
 ## Generated data
 
+An optional private SQLite storage layer, legacy-record review, encrypted
+backups, and 20-day retention for unconverted pre-enrollments are being
+prepared for version 1.0. They are **not enabled automatically** and do not
+delete existing files. See the [data-protection plan](docs/protecao-de-dados-v1.md)
+(in Portuguese).
+
 The local storage layer writes records to:
 
 - `data/pre_matriculas.jsonl` for pre-enrollment requests;
@@ -295,7 +301,7 @@ docker build -t castilla-bot .
 docker run --rm -p 8000:8000 --env-file .env castilla-bot
 ```
 
-The container runs Gunicorn with two workers and exposes port `8000`.
+The container runs Gunicorn with one worker and exposes port `8000`.
 
 ## Current scope and next steps
 

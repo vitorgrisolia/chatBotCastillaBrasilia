@@ -4,9 +4,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import os
 from typing import Any
 
-from .storage import JsonlStorage
+from .private_storage import PrivateSqliteStorage
+from .storage import JsonlStorage, RecordStorage
+from .validation import normalize_cpf
 
 
 MAIN_OPTIONS = {
@@ -123,8 +126,19 @@ class Session:
 class CastillaBot:
     """Processa uma mensagem por vez e mantém sessões por identificador."""
 
-    def __init__(self, storage: JsonlStorage | None = None) -> None:
-        self.storage = storage or JsonlStorage()
+    def __init__(self, storage: RecordStorage | None = None) -> None:
+        if storage is not None:
+            self.storage = storage
+        else:
+            backend = os.getenv("CASTILLA_STORAGE_BACKEND", "jsonl").casefold()
+            if backend == "sqlite":
+                self.storage = PrivateSqliteStorage(
+                    os.getenv("CASTILLA_DB_PATH", "data/private/castilla.sqlite3")
+                )
+            elif backend == "jsonl":
+                self.storage = JsonlStorage()
+            else:
+                raise ValueError("CASTILLA_STORAGE_BACKEND deve ser jsonl ou sqlite")
         self.sessions: dict[str, Session] = {}
 
     def start(self, session_id: str) -> str:
@@ -204,6 +218,11 @@ class CastillaBot:
 
     def _pre_enrollment(self, session: Session, answer: str) -> str:
         key, _ = PRE_ENROLLMENT_FIELDS[session.field_index]
+        if key == "cpf":
+            cpf = normalize_cpf(answer)
+            if cpf is None:
+                return "CPF inválido. Confira os 11 números e envie novamente."
+            answer = cpf
         session.data[key] = answer
         session.field_index += 1
         if session.field_index < len(PRE_ENROLLMENT_FIELDS):

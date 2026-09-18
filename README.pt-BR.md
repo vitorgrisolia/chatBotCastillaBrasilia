@@ -155,6 +155,11 @@ eventos, eventos de status e o comportamento da primeira mensagem.
 
 ## Dados gerados
 
+Uma camada opcional de banco SQLite privado, revisão de cadastros antigos,
+backup cifrado e retenção de pré-matrículas pendentes por 20 dias está em
+preparação para a versão 1.0. Ela **não é ativada automaticamente** e não apaga
+os arquivos existentes. Veja [Proteção de dados — versão 1.0](docs/protecao-de-dados-v1.md).
+
 A persistência local grava os registros em:
 
 - `data/pre_matriculas.jsonl` para solicitações de pré-matrícula;
@@ -299,7 +304,7 @@ docker build -t castilla-bot .
 docker run --rm -p 8000:8000 --env-file .env castilla-bot
 ```
 
-O contêiner utiliza Gunicorn com dois processos e expõe a porta `8000`.
+O contêiner utiliza Gunicorn com um processo e expõe a porta `8000`.
 
 ## Escopo atual e próximos passos
 
