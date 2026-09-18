@@ -87,7 +87,33 @@ class PrivateSqliteStorage:
                 );
                 CREATE INDEX IF NOT EXISTS records_retention
                     ON records(collection, status, received_at_unix);
+                CREATE TABLE IF NOT EXISTS sessions (
+                    session_id TEXT PRIMARY KEY,
+                    state TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
                 """
+            )
+
+    def load_session(self, session_id: str) -> dict[str, object] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT state FROM sessions WHERE session_id = ?", (session_id,)
+            ).fetchone()
+        return json.loads(row["state"]) if row else None
+
+    def save_session(self, session_id: str, state: dict[str, object]) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """INSERT INTO sessions (session_id, state, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    state = excluded.state, updated_at = excluded.updated_at""",
+                (
+                    session_id,
+                    json.dumps(state, ensure_ascii=False),
+                    datetime.now(timezone.utc).isoformat(),
+                ),
             )
 
     @contextmanager

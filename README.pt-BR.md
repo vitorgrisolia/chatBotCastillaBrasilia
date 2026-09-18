@@ -227,10 +227,14 @@ O telefone precisa ser o mesmo identificador recebido no webhook. A rota não
 envia mensagem ao cliente; ela apenas reativa o bot para a próxima mensagem.
 Sem `OPERATOR_TOKEN`, a rota fica desativada.
 
-As sessões ainda ficam na memória: use um único processo do bot (o Dockerfile
-já está configurado assim). Reiniciar o serviço apaga o estado dos atendimentos
-em andamento; antes de operar em produção com múltiplos processos, será
-necessário persistir as sessões em um armazenamento compartilhado.
+Com `CASTILLA_STORAGE_BACKEND=sqlite`, as sessões também ficam no banco privado:
+reiniciar um único processo do bot não libera atendimentos pendentes. O modo
+antigo (`jsonl`) ainda mantém as sessões só na memória e **não deve ser usado
+para aprovar o teste de reinício**. Mantenha um único processo (como no
+Dockerfile); múltiplos processos exigem coordenação adicional.
+
+Veja o [roteiro de teste da passagem para o atendente](docs/teste-passagem-atendente.md)
+antes de liberar esse fluxo em produção.
 
 ## Publicar o webhook local com Cloudflare Tunnel
 

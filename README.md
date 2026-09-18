@@ -226,9 +226,14 @@ The phone number must match the identifier received by the webhook. This route
 does not message the customer; it only resumes the bot for the next customer
 message. Without `OPERATOR_TOKEN`, the route is disabled.
 
-Sessions are still in memory: run a single bot process (as configured in the
-Dockerfile). Restarting the service clears pending handoffs. Production setups
-with multiple processes will need shared, persistent session storage.
+With `CASTILLA_STORAGE_BACKEND=sqlite`, sessions are also stored in the private
+database, so restarting a single bot process does not release pending handoffs.
+The legacy `jsonl` mode still keeps sessions only in memory and must not pass
+the restart acceptance test. Keep one process (as in the Dockerfile); multiple
+processes need additional coordination.
+
+See the [human handoff test procedure](docs/teste-passagem-atendente.md) before
+enabling this flow in production.
 
 ## Expose the local webhook with Cloudflare Tunnel
 

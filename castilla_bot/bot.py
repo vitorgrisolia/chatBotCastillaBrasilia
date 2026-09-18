@@ -5,10 +5,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import os
+from threading import RLock
 from typing import Any
 
 from .private_storage import PrivateSqliteStorage
-from .storage import JsonlStorage, RecordStorage
+from .storage import JsonlStorage, RecordStorage, SessionStorage
 from .validation import normalize_cpf
 
 
@@ -126,7 +127,11 @@ class Session:
 class CastillaBot:
     """Processa uma mensagem por vez e mantém sessões por identificador."""
 
-    def __init__(self, storage: RecordStorage | None = None) -> None:
+    def __init__(
+        self,
+        storage: RecordStorage | None = None,
+        session_storage: SessionStorage | None = None,
+    ) -> None:
         if storage is not None:
             self.storage = storage
         else:
@@ -140,13 +145,63 @@ class CastillaBot:
             else:
                 raise ValueError("CASTILLA_STORAGE_BACKEND deve ser jsonl ou sqlite")
         self.sessions: dict[str, Session] = {}
+        self.session_storage = session_storage or (
+            self.storage if isinstance(self.storage, PrivateSqliteStorage) else None
+        )
+        self._lock = RLock()
+
+    def _session(self, session_id: str) -> Session | None:
+        if self.session_storage is not None:
+            saved = self.session_storage.load_session(session_id)
+            if saved is not None:
+                session = Session(
+                    state=saved["state"],
+                    data=saved["data"],
+                    field_index=saved["field_index"],
+                    selected_options=set(saved["selected_options"]),
+                )
+                self.sessions[session_id] = session
+                return session
+        return self.sessions.get(session_id)
+
+    def _save_session(self, session_id: str, session: Session) -> None:
+        if self.session_storage is not None:
+            self.session_storage.save_session(
+                session_id,
+                {
+                    "state": session.state,
+                    "data": session.data,
+                    "field_index": session.field_index,
+                    "selected_options": sorted(session.selected_options),
+                },
+            )
+
+    def receive(self, session_id: str, message: str) -> str | None:
+        """Inicia ou continua uma conversa em uma única seção crítica."""
+        with self._lock:
+            if self._session(session_id) is None:
+                return self.start(session_id)
+            return self.handle(session_id, message)
 
     def start(self, session_id: str) -> str:
-        self.sessions[session_id] = Session()
-        return WELCOME
+        with self._lock:
+            session = Session()
+            self.sessions[session_id] = session
+            self._save_session(session_id, session)
+            return WELCOME
 
     def handle(self, session_id: str, message: str) -> str | None:
-        session = self.sessions.setdefault(session_id, Session())
+        with self._lock:
+            session = self._session(session_id)
+            if session is None:
+                session = Session()
+                self.sessions[session_id] = session
+            response = self._handle_session(session_id, session, message)
+            if self.sessions[session_id] is session:
+                self._save_session(session_id, session)
+            return response
+
+    def _handle_session(self, session_id: str, session: Session, message: str) -> str | None:
         # Durante o atendimento humano, nem comandos do cliente reativam o bot.
         if session.state == "human_pending":
             return None
@@ -178,17 +233,19 @@ class CastillaBot:
 
     def attendant_message(self, session_id: str, message: str) -> bool:
         """Reativa o bot somente após o encerramento enviado pelo atendente."""
-        session = self.sessions.get(session_id)
-        if (
-            session is None
-            or session.state != "human_pending"
-            or message.strip().casefold() != "atendimento finalizado"
-        ):
-            return False
-        session.state = "main"
-        session.data = {}
-        session.field_index = 0
-        return True
+        with self._lock:
+            session = self._session(session_id)
+            if (
+                session is None
+                or session.state != "human_pending"
+                or message.strip().casefold() != "atendimento finalizado"
+            ):
+                return False
+            session.state = "main"
+            session.data = {}
+            session.field_index = 0
+            self._save_session(session_id, session)
+            return True
 
     def _main(self, session: Session, answer: str) -> str:
         if answer in session.selected_options:

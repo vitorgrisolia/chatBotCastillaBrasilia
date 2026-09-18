@@ -4,14 +4,16 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import logging
 import os
+import re
 from typing import Any
 
 import requests
 from dotenv import load_dotenv
 from flask import Flask, Response, jsonify, request
 
-from .bot import CastillaBot
+from .bot import CastillaBot, HUMAN_DONE
 
 
 # O arquivo .env é a fonte de configuração deste projeto. Isso evita que valores
@@ -61,10 +63,12 @@ def create_app(
     verify_token: str | None = None,
     app_secret: str | None = None,
     operator_token: str | None = None,
+    phone_number_id: str | None = None,
 ) -> Flask:
     """Cria a aplicação Flask; parâmetros opcionais facilitam os testes."""
 
     app = Flask(__name__)
+    app.logger.setLevel(logging.INFO)
     chatbot = bot or CastillaBot()
     configured_operator_token = (
         os.getenv("OPERATOR_TOKEN", "") if operator_token is None else operator_token
@@ -73,14 +77,19 @@ def create_app(
         environment = _configuration_from_environment()
         configured_verify_token = verify_token or environment["WHATSAPP_VERIFY_TOKEN"]
         configured_app_secret = app_secret or environment["META_APP_SECRET"]
+        configured_phone_number_id = phone_number_id or environment["WHATSAPP_PHONE_NUMBER_ID"]
         whatsapp_client = WhatsAppClient(
             environment["WHATSAPP_ACCESS_TOKEN"],
-            environment["WHATSAPP_PHONE_NUMBER_ID"],
+            configured_phone_number_id,
             environment["META_GRAPH_API_VERSION"],
         )
     else:
         configured_verify_token = verify_token or os.getenv("WHATSAPP_VERIFY_TOKEN", "")
         configured_app_secret = app_secret or os.getenv("META_APP_SECRET", "")
+        configured_phone_number_id = (
+            os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")
+            if phone_number_id is None else phone_number_id
+        )
         whatsapp_client = client
 
     @app.get("/")
@@ -107,19 +116,23 @@ def create_app(
         payload = request.get_json(silent=True) or {}
         # Em contas com coexistência, a Meta envia as mensagens digitadas no
         # WhatsApp Business da escola em um evento distinto das do cliente.
-        for outgoing in _business_app_message_echoes(payload):
-            chatbot.attendant_message(outgoing["to"], outgoing["text"]["body"])
+        for outgoing in _business_app_message_echoes(payload, configured_phone_number_id):
+            customer = _contact_id(outgoing["to"])
+            if customer:
+                completed = chatbot.attendant_message(customer, outgoing["text"]["body"])
+                if completed:
+                    app.logger.info("Atendimento humano encerrado pelo WhatsApp Business")
         # A Meta pode agrupar mais de uma entrada/alteração/mensagem no evento.
-        for incoming in _text_messages(payload):
-            sender = incoming["from"]
+        for incoming in _text_messages(payload, configured_phone_number_id):
+            sender = _contact_id(incoming["from"])
+            if sender is None:
+                continue
             message = incoming["text"]["body"]
-            if sender not in chatbot.sessions:
-                reply = chatbot.start(sender)
-                # A primeira mensagem do usuário inicia a sessão e recebe o menu.
-            else:
-                reply = chatbot.handle(sender, message)
+            reply = chatbot.receive(sender, message)
             if reply is not None:
                 whatsapp_client.send_text(sender, reply)
+                if reply == HUMAN_DONE:
+                    app.logger.info("Aviso de passagem para atendente enviado")
         # O recebimento deve ser confirmado mesmo quando o evento é só um status.
         return jsonify({"status": "received"}), 200
 
@@ -138,6 +151,9 @@ def create_app(
         message = payload.get("message")
         if not isinstance(session_id, str) or not isinstance(message, str):
             return jsonify({"error": "customer_phone and message are required"}), 400
+        session_id = _contact_id(session_id)
+        if session_id is None:
+            return jsonify({"error": "invalid customer_phone"}), 400
         if message.strip().casefold() != "atendimento finalizado":
             return jsonify({"error": "invalid completion phrase"}), 400
         if not chatbot.attendant_message(session_id, message):
@@ -165,20 +181,31 @@ def _configuration_from_environment() -> dict[str, str]:
     return values
 
 
-def _text_messages(payload: dict[str, Any]) -> list[dict[str, Any]]:
+def _text_messages(
+    payload: dict[str, Any], phone_number_id: str = ""
+) -> list[dict[str, Any]]:
     messages: list[dict[str, Any]] = []
     for entry in payload.get("entry", []):
         for change in entry.get("changes", []):
             if change.get("field") not in (None, "messages"):
                 continue
             value = change.get("value", {})
+            if not _for_business_number(value, phone_number_id):
+                continue
             for message in value.get("messages", []):
-                if message.get("type") == "text" and message.get("from"):
+                if (
+                    message.get("type") == "text"
+                    and isinstance(message.get("from"), str)
+                    and isinstance(message.get("text"), dict)
+                    and isinstance(message["text"].get("body"), str)
+                ):
                     messages.append(message)
     return messages
 
 
-def _business_app_message_echoes(payload: dict[str, Any]) -> list[dict[str, Any]]:
+def _business_app_message_echoes(
+    payload: dict[str, Any], phone_number_id: str = ""
+) -> list[dict[str, Any]]:
     """Extrai mensagens enviadas pelo atendente no app WhatsApp Business."""
     echoes: list[dict[str, Any]] = []
     for entry in payload.get("entry", []):
@@ -186,6 +213,8 @@ def _business_app_message_echoes(payload: dict[str, Any]) -> list[dict[str, Any]
             if change.get("field") != "smb_message_echoes":
                 continue
             value = change.get("value", {})
+            if not _for_business_number(value, phone_number_id):
+                continue
             for echo in value.get("message_echoes", []):
                 if (
                     echo.get("type") == "text"
@@ -195,6 +224,19 @@ def _business_app_message_echoes(payload: dict[str, Any]) -> list[dict[str, Any]
                 ):
                     echoes.append(echo)
     return echoes
+
+
+def _for_business_number(value: dict[str, Any], phone_number_id: str) -> bool:
+    if not phone_number_id:
+        return True
+    metadata = value.get("metadata", {})
+    return isinstance(metadata, dict) and metadata.get("phone_number_id") == phone_number_id
+
+
+def _contact_id(raw: str) -> str | None:
+    if re.fullmatch(r"\+?[0-9]{8,15}", raw):
+        return raw.removeprefix("+")
+    return None
 
 
 def _valid_signature(body: bytes, received: str, app_secret: str) -> bool:

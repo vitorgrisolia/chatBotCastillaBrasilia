@@ -12,6 +12,12 @@ class RecordStorage(Protocol):
     def save(self, collection: str, record: dict[str, Any]) -> str | None: ...
 
 
+class SessionStorage(Protocol):
+    def load_session(self, session_id: str) -> dict[str, Any] | None: ...
+
+    def save_session(self, session_id: str, state: dict[str, Any]) -> None: ...
+
+
 class JsonlStorage:
     """Grava um objeto JSON por linha, com segurança entre threads."""
 
