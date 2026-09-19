@@ -1,0 +1,36 @@
+# Modelo de implantação. Troque o nome antes de criar um app na conta da escola.
+app = "CHANGE_ME"
+primary_region = "gru"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT = "8000"
+  CASTILLA_ENV = "production"
+  CASTILLA_INACTIVITY_SECONDS = "30"
+  CASTILLA_STORAGE_BACKEND = "sqlite"
+  CASTILLA_DB_PATH = "/data/private/castilla.sqlite3"
+
+[http_service]
+  internal_port = 8000
+  force_https = true
+  auto_stop_machines = "off"
+  auto_start_machines = true
+
+[[http_service.checks]]
+  grace_period = "10s"
+  interval = "30s"
+  method = "GET"
+  timeout = "5s"
+  path = "/ready"
+
+[mounts]
+  source = "castilla_data"
+  destination = "/data"
+  initial_size = "1GB"
+
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory = "512mb"

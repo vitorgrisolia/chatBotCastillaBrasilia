@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import os
 from threading import RLock
-from typing import Any
+from typing import Any, Callable
 
 from .private_storage import PrivateSqliteStorage
 from .storage import JsonlStorage, RecordStorage, SessionStorage
-from .validation import normalize_cpf
+from .validation import normalize_cpf, normalize_email, normalize_whatsapp
 
 
 MAIN_OPTIONS = {
@@ -92,6 +92,10 @@ Digite MENU para visualizar as opções restantes ou ATENDENTE para falar com no
 
 HUMAN_DONE = """✅ Solicitação recebida. Aguarde um momento: um de nossos atendentes continuará a conversa por aqui assim que estiver disponível."""
 
+INACTIVITY_DONE = """⏱️ Atendimento automático encerrado por falta de interação.
+
+Quando quiser continuar, envie uma nova mensagem para iniciar outro atendimento."""
+
 PLANS_BY_OPTION = {
     "1": "Conversação — R$ 147,00/mês",
     "2": "Básico — R$ 197,00/mês",
@@ -122,6 +126,14 @@ class Session:
     data: dict[str, Any] = field(default_factory=dict)
     field_index: int = 0
     selected_options: set[str] = field(default_factory=set)
+    pending_reply: str | None = None
+    pending_message_id: str | None = None
+    processed_message_ids: list[str] = field(default_factory=list)
+    last_activity_at: str | None = None
+
+
+class PendingDelivery(RuntimeError):
+    """Um envio anterior precisa ser confirmado antes de processar outro evento."""
 
 
 class CastillaBot:
@@ -131,11 +143,15 @@ class CastillaBot:
         self,
         storage: RecordStorage | None = None,
         session_storage: SessionStorage | None = None,
+        inactivity_seconds: float | None = None,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         if storage is not None:
             self.storage = storage
         else:
             backend = os.getenv("CASTILLA_STORAGE_BACKEND", "jsonl").casefold()
+            if os.getenv("CASTILLA_ENV", "development").casefold() == "production" and backend != "sqlite":
+                raise RuntimeError("Em produção, CASTILLA_STORAGE_BACKEND deve ser sqlite")
             if backend == "sqlite":
                 self.storage = PrivateSqliteStorage(
                     os.getenv("CASTILLA_DB_PATH", "data/private/castilla.sqlite3")
@@ -148,6 +164,14 @@ class CastillaBot:
         self.session_storage = session_storage or (
             self.storage if isinstance(self.storage, PrivateSqliteStorage) else None
         )
+        configured_timeout = (
+            float(os.getenv("CASTILLA_INACTIVITY_SECONDS", "30"))
+            if inactivity_seconds is None else inactivity_seconds
+        )
+        if configured_timeout <= 0:
+            raise ValueError("O tempo de inatividade deve ser maior que zero")
+        self.inactivity_seconds = configured_timeout
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._lock = RLock()
 
     def _session(self, session_id: str) -> Session | None:
@@ -159,6 +183,10 @@ class CastillaBot:
                     data=saved["data"],
                     field_index=saved["field_index"],
                     selected_options=set(saved["selected_options"]),
+                    pending_reply=saved.get("pending_reply"),
+                    pending_message_id=saved.get("pending_message_id"),
+                    processed_message_ids=saved.get("processed_message_ids", []),
+                    last_activity_at=saved.get("last_activity_at"),
                 )
                 self.sessions[session_id] = session
                 return session
@@ -173,19 +201,68 @@ class CastillaBot:
                     "data": session.data,
                     "field_index": session.field_index,
                     "selected_options": sorted(session.selected_options),
+                    "pending_reply": session.pending_reply,
+                    "pending_message_id": session.pending_message_id,
+                    "processed_message_ids": session.processed_message_ids,
+                    "last_activity_at": session.last_activity_at,
                 },
             )
 
-    def receive(self, session_id: str, message: str) -> str | None:
-        """Inicia ou continua uma conversa em uma única seção crítica."""
+    def receive(self, session_id: str, message: str, message_id: str | None = None) -> str | None:
+        """Processa um evento da Meta sem repetir efeitos de um ID já concluído."""
         with self._lock:
-            if self._session(session_id) is None:
-                return self.start(session_id)
-            return self.handle(session_id, message)
+            now = self._now()
+            session = self._session(session_id)
+            if session is not None:
+                if message_id and message_id in session.processed_message_ids:
+                    return None
+                if session.pending_reply is not None:
+                    if session.pending_message_id not in (None, message_id):
+                        raise PendingDelivery("Aguarde o envio anterior")
+                    return session.pending_reply
+            expired = session is not None and self._is_inactive(session, now)
+            previously_closed = session is not None and session.state == "inactive_closed"
+            if session is None or expired or previously_closed:
+                session = Session()
+                self.sessions[session_id] = session
+                reply = (INACTIVITY_DONE + "\n\n" + WELCOME) if expired else WELCOME
+            else:
+                reply = self._handle_session(session_id, session, message)
+                # REINICIAR troca o objeto da sessão.
+                session = self.sessions[session_id]
+            if session.state != "human_pending":
+                session.last_activity_at = now.isoformat()
+            else:
+                session.last_activity_at = None
+            if reply is None:
+                self._remember_message(session, message_id)
+            else:
+                session.pending_reply = reply
+                session.pending_message_id = message_id
+            self._save_session(session_id, session)
+            return reply
+
+    def reply_delivered(self, session_id: str, message_id: str | None = None) -> None:
+        """Confirma o envio e libera o processamento da próxima mensagem."""
+        with self._lock:
+            session = self._session(session_id)
+            if session is not None and session.pending_reply is not None:
+                if session.pending_message_id != message_id:
+                    raise ValueError("ID da mensagem pendente não corresponde")
+                self._remember_message(session, message_id)
+                session.pending_reply = None
+                session.pending_message_id = None
+                self._save_session(session_id, session)
+
+    @staticmethod
+    def _remember_message(session: Session, message_id: str | None) -> None:
+        if message_id and message_id not in session.processed_message_ids:
+            session.processed_message_ids.append(message_id)
+            del session.processed_message_ids[:-100]
 
     def start(self, session_id: str) -> str:
         with self._lock:
-            session = Session()
+            session = Session(last_activity_at=self._now().isoformat())
             self.sessions[session_id] = session
             self._save_session(session_id, session)
             return WELCOME
@@ -214,6 +291,9 @@ class CastillaBot:
             session.state = "main"
             session.data = {}
             session.field_index = 0
+            self._remember_message(session, session.pending_message_id)
+            session.pending_reply = None
+            session.pending_message_id = None
             return self._remaining_menu(session)
         if normalized == "atendente":
             session.selected_options.add("6")
@@ -244,8 +324,70 @@ class CastillaBot:
             session.state = "main"
             session.data = {}
             session.field_index = 0
+            session.last_activity_at = None
             self._save_session(session_id, session)
             return True
+
+    def inactivity_deadline(self, session_id: str) -> tuple[str, datetime] | None:
+        """Retorna a atividade esperada e o prazo, ou None quando não há temporizador."""
+        with self._lock:
+            session = self._session(session_id)
+            if (
+                session is None
+                or session.state in {"human_pending", "inactive_closed"}
+                or session.last_activity_at is None
+            ):
+                return None
+            activity = self._parse_activity(session.last_activity_at)
+            return session.last_activity_at, activity + timedelta(seconds=self.inactivity_seconds)
+
+    def inactivity_is_due(self, session_id: str, expected_activity: str) -> bool:
+        with self._lock:
+            session = self._session(session_id)
+            return bool(
+                session is not None
+                and session.last_activity_at == expected_activity
+                and self._is_inactive(session, self._now())
+            )
+
+    def close_for_inactivity(self, session_id: str, expected_activity: str) -> bool:
+        """Encerra exatamente a sessão que originou o temporizador."""
+        with self._lock:
+            session = self._session(session_id)
+            if (
+                session is None
+                or session.last_activity_at != expected_activity
+                or not self._is_inactive(session, self._now())
+            ):
+                return False
+            session.state = "inactive_closed"
+            session.data = {}
+            session.field_index = 0
+            session.selected_options.clear()
+            session.pending_reply = None
+            session.pending_message_id = None
+            session.last_activity_at = None
+            self._save_session(session_id, session)
+            return True
+
+    def _is_inactive(self, session: Session, now: datetime) -> bool:
+        if session.state in {"human_pending", "inactive_closed"} or session.last_activity_at is None:
+            return False
+        activity = self._parse_activity(session.last_activity_at)
+        return now >= activity + timedelta(seconds=self.inactivity_seconds)
+
+    @staticmethod
+    def _parse_activity(value: str) -> datetime:
+        moment = datetime.fromisoformat(value)
+        if moment.tzinfo is None:
+            raise ValueError("last_activity_at precisa informar o fuso horário")
+        return moment.astimezone(timezone.utc)
+
+    def _now(self) -> datetime:
+        now = self._clock()
+        if now.tzinfo is None:
+            raise ValueError("O relógio precisa informar o fuso horário")
+        return now.astimezone(timezone.utc)
 
     def _main(self, session: Session, answer: str) -> str:
         if answer in session.selected_options:
@@ -275,11 +417,21 @@ class CastillaBot:
 
     def _pre_enrollment(self, session: Session, answer: str) -> str:
         key, _ = PRE_ENROLLMENT_FIELDS[session.field_index]
-        if key == "cpf":
+        if key == "email":
+            email = normalize_email(answer)
+            if email is None:
+                return "E-mail inválido. Confira o endereço e envie novamente."
+            answer = email
+        elif key == "cpf":
             cpf = normalize_cpf(answer)
             if cpf is None:
                 return "CPF inválido. Confira os 11 números e envie novamente."
             answer = cpf
+        elif key == "whatsapp":
+            whatsapp = normalize_whatsapp(answer)
+            if whatsapp is None:
+                return "WhatsApp inválido. Envie o número com DDD, por exemplo: (61) 99999-9999."
+            answer = whatsapp
         session.data[key] = answer
         session.field_index += 1
         if session.field_index < len(PRE_ENROLLMENT_FIELDS):

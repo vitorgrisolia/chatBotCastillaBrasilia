@@ -44,11 +44,14 @@ The pre-enrollment flow collects the customer's full name, address, email, CPF
 (Brazilian taxpayer ID), and WhatsApp number. After the final answer, the bot
 confirms the chosen plan and price and informs the customer that a team member
 will contact them to complete the enrollment.
+The bot checks CPF digits, email syntax, and Brazilian WhatsApp numbers with an
+area code before advancing. These checks do not verify ownership of the contacts.
 
 ## How it works
 
 `CastillaBot` processes one message at a time. Each customer is identified by a
-`session_id`, which maps to an in-memory `Session` containing:
+`session_id`, which maps to a `Session` held in memory by default or persisted
+in private SQLite storage when enabled, containing:
 
 - the current conversation state;
 - the data already collected;
@@ -58,12 +61,17 @@ will contact them to complete the enrollment.
 The active state selects the appropriate handler for each incoming message. The
 handler validates the menu option, updates the session, and returns the next
 text response. Completed pre-enrollments and human-support requests are written
-as independent JSON objects in JSONL files.
+to JSONL by default or to private SQLite storage when enabled.
 
 For WhatsApp, Meta sends events to the Flask webhook. The application verifies
 the request signature, extracts incoming text messages, uses the sender's phone
 number as the session identifier, runs the conversational core, and sends the
 reply through the Graph API.
+
+During the automated flow, every customer message resets a 30-second inactivity
+timer. When it expires, the bot sends one closure notice, clears the session,
+and starts a new service on the customer's next message. The timer is disabled
+after human handoff, which still ends only when the attendant completes it.
 
 After handoff, the bot sends one confirmation and stays silent, including for
 `MENU` and `REINICIAR`. If the school's number uses WhatsApp Business App and
@@ -205,7 +213,9 @@ python -m castilla_bot.whatsapp
 ```
 
 The default port is `8000`. It can be changed through the `PORT` environment
-variable. `GET /` is the health endpoint, while `GET /webhook` and
+variable. `GET /` checks the process and `GET /ready` checks database access
+when SQLite is enabled. Production mode (`CASTILLA_ENV=production`) refuses
+legacy JSONL storage. `GET /webhook` and
 `POST /webhook` verify and receive Meta events.
 
 To close service from WhatsApp Business itself, set up App/Cloud API
@@ -234,6 +244,7 @@ processes need additional coordination.
 
 See the [human handoff test procedure](docs/teste-passagem-atendente.md) before
 enabling this flow in production.
+See the [critical 1.0 release criteria](docs/criterios-lancamento-v1.md).
 
 ## Expose the local webhook with Cloudflare Tunnel
 

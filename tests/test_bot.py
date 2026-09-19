@@ -1,9 +1,10 @@
 import json
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from castilla_bot.bot import CastillaBot, INVALID, PRE_ENROLLMENT_FIELDS, WELCOME
+from castilla_bot.bot import CastillaBot, INACTIVITY_DONE, INVALID, PRE_ENROLLMENT_FIELDS, WELCOME
 from castilla_bot.storage import JsonlStorage
 
 
@@ -89,7 +90,12 @@ class CastillaBotTests(unittest.TestCase):
         self.assertIn("Nome completo", first_prompt)
         response = ""
         for index in range(len(PRE_ENROLLMENT_FIELDS)):
-            answer = "529.982.247-25" if PRE_ENROLLMENT_FIELDS[index][0] == "cpf" else f"resposta-{index}"
+            key = PRE_ENROLLMENT_FIELDS[index][0]
+            answer = {
+                "email": "Aluna@Example.COM",
+                "cpf": "529.982.247-25",
+                "whatsapp": "(61) 99999-9999",
+            }.get(key, f"resposta-{index}")
             response = self.bot.handle(self.session, answer)
         self.assertIn("Pré-matrícula recebida", response)
         self.assertIn("Básico — R$ 197,00/mês", response)
@@ -102,9 +108,22 @@ class CastillaBotTests(unittest.TestCase):
         self.assertEqual(record["plano"], "Básico — R$ 197,00/mês")
         self.assertEqual(record["nome_completo"], "resposta-0")
         self.assertEqual(record["endereco"], "resposta-1")
-        self.assertEqual(record["email"], "resposta-2")
+        self.assertEqual(record["email"], "Aluna@example.com")
         self.assertEqual(record["cpf"], "52998224725")
-        self.assertEqual(record["whatsapp"], "resposta-4")
+        self.assertEqual(record["whatsapp"], "5561999999999")
+
+    def test_invalid_email_and_whatsapp_do_not_advance_or_save(self):
+        self.bot.handle(self.session, "4")
+        self.bot.handle(self.session, "2")
+        self.bot.handle(self.session, "Maria")
+        self.bot.handle(self.session, "Rua Central")
+        self.assertIn("E-mail inválido", self.bot.handle(self.session, "maria@"))
+        self.assertIn("E-mail inválido", self.bot.handle(self.session, "maria..silva@example.com"))
+        self.assertIn("CPF", self.bot.handle(self.session, "maria@example.com"))
+        self.assertIn("WhatsApp", self.bot.handle(self.session, "529.982.247-25"))
+        self.assertIn("WhatsApp inválido", self.bot.handle(self.session, "99999-9999"))
+        self.assertFalse((Path(self.temp_dir.name) / "pre_matriculas.jsonl").exists())
+        self.assertIn("Pré-matrícula recebida", self.bot.handle(self.session, "+55 (61) 99999-9999"))
 
     def test_invalid_cpf_is_rejected_without_advancing(self):
         self.bot.handle(self.session, "4")
@@ -115,6 +134,42 @@ class CastillaBotTests(unittest.TestCase):
         self.assertIn("CPF inválido", self.bot.handle(self.session, "529.982.247-24"))
         self.assertFalse((Path(self.temp_dir.name) / "pre_matriculas.jsonl").exists())
         self.assertIn("WhatsApp", self.bot.handle(self.session, "529.982.247-25"))
+
+    def test_inactivity_resets_automatic_service_after_30_seconds(self):
+        now = [datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)]
+        bot = CastillaBot(
+            JsonlStorage(self.temp_dir.name),
+            inactivity_seconds=30,
+            clock=lambda: now[0],
+        )
+        self.assertEqual(bot.receive("timeout-client", "Olá", "m1"), WELCOME)
+        bot.reply_delivered("timeout-client", "m1")
+
+        now[0] += timedelta(seconds=29)
+        self.assertIn("curso de inglês", bot.receive("timeout-client", "1", "m2"))
+        bot.reply_delivered("timeout-client", "m2")
+
+        now[0] += timedelta(seconds=30)
+        response = bot.receive("timeout-client", "2", "m3")
+        self.assertIn(INACTIVITY_DONE, response)
+        self.assertIn(WELCOME, response)
+        self.assertNotIn("três tipos de aula", response)
+
+    def test_human_handoff_has_no_inactivity_timeout(self):
+        now = [datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)]
+        bot = CastillaBot(
+            JsonlStorage(self.temp_dir.name),
+            inactivity_seconds=30,
+            clock=lambda: now[0],
+        )
+        for index, message in enumerate(("Olá", "6", "Maria", "Dúvida"), start=1):
+            message_id = f"human-{index}"
+            reply = bot.receive("human-client", message, message_id)
+            if reply is not None:
+                bot.reply_delivered("human-client", message_id)
+        self.assertIsNone(bot.inactivity_deadline("human-client"))
+        now[0] += timedelta(hours=1)
+        self.assertIsNone(bot.receive("human-client", "Ainda aguardando", "human-5"))
 
 
 if __name__ == "__main__":

@@ -102,6 +102,11 @@ class PrivateSqliteStorage:
             ).fetchone()
         return json.loads(row["state"]) if row else None
 
+    def check_readiness(self) -> None:
+        """Falha se o banco ou a tabela de sessões não estiver acessível."""
+        with self._connect() as connection:
+            connection.execute("SELECT 1 FROM sessions LIMIT 1").fetchone()
+
     def save_session(self, session_id: str, state: dict[str, object]) -> None:
         with self._connect() as connection:
             connection.execute(

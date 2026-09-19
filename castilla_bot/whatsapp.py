@@ -7,13 +7,16 @@ import hmac
 import logging
 import os
 import re
-from typing import Any
+from datetime import datetime, timezone
+from threading import Lock, Timer
+from typing import Any, Callable
 
 import requests
 from dotenv import load_dotenv
 from flask import Flask, Response, jsonify, request
 
-from .bot import CastillaBot, HUMAN_DONE
+from .bot import CastillaBot, HUMAN_DONE, INACTIVITY_DONE
+from .private_storage import PrivateSqliteStorage
 
 
 # O arquivo .env é a fonte de configuração deste projeto. Isso evita que valores
@@ -57,6 +60,53 @@ class WhatsAppClient:
         response.raise_for_status()
 
 
+class InactivityScheduler:
+    """Mantém no máximo um temporizador ativo para cada conversa."""
+
+    def __init__(self, callback: Callable[[str, str], None]) -> None:
+        self.callback = callback
+        self._lock = Lock()
+        self._timers: dict[str, tuple[str, Timer]] = {}
+
+    def schedule(
+        self,
+        session_id: str,
+        expected_activity: str,
+        deadline: datetime | None = None,
+        *,
+        delay_seconds: float | None = None,
+    ) -> None:
+        if delay_seconds is None:
+            if deadline is None:
+                raise ValueError("Informe deadline ou delay_seconds")
+            delay_seconds = max(
+                0.0,
+                (deadline.astimezone(timezone.utc) - datetime.now(timezone.utc)).total_seconds(),
+            )
+        timer = Timer(delay_seconds, self._run, args=(session_id, expected_activity))
+        timer.daemon = True
+        with self._lock:
+            previous = self._timers.pop(session_id, None)
+            if previous is not None:
+                previous[1].cancel()
+            self._timers[session_id] = (expected_activity, timer)
+        timer.start()
+
+    def cancel(self, session_id: str) -> None:
+        with self._lock:
+            previous = self._timers.pop(session_id, None)
+        if previous is not None:
+            previous[1].cancel()
+
+    def _run(self, session_id: str, expected_activity: str) -> None:
+        with self._lock:
+            current = self._timers.get(session_id)
+            if current is None or current[0] != expected_activity:
+                return
+            self._timers.pop(session_id, None)
+        self.callback(session_id, expected_activity)
+
+
 def create_app(
     bot: CastillaBot | None = None,
     client: WhatsAppClient | None = None,
@@ -69,7 +119,15 @@ def create_app(
 
     app = Flask(__name__)
     app.logger.setLevel(logging.INFO)
+    # Um único processo: eventos repetidos da mesma conversa não podem enviar
+    # respostas simultâneas enquanto a primeira chamada à Meta está pendente.
+    contact_locks = [Lock() for _ in range(64)]
     chatbot = bot or CastillaBot()
+    if (
+        os.getenv("CASTILLA_ENV", "development").casefold() == "production"
+        and not isinstance(chatbot.storage, PrivateSqliteStorage)
+    ):
+        raise RuntimeError("Em produção, o armazenamento deve ser SQLite privado")
     configured_operator_token = (
         os.getenv("OPERATOR_TOKEN", "") if operator_token is None else operator_token
     )
@@ -92,9 +150,43 @@ def create_app(
         )
         whatsapp_client = client
 
+    scheduler: InactivityScheduler
+
+    def close_inactive_service(customer: str, expected_activity: str) -> None:
+        with contact_locks[hash(customer) % len(contact_locks)]:
+            if not chatbot.inactivity_is_due(customer, expected_activity):
+                return
+            try:
+                whatsapp_client.send_text(customer, INACTIVITY_DONE)
+                if chatbot.close_for_inactivity(customer, expected_activity):
+                    app.logger.info("Atendimento automático encerrado por inatividade")
+            except Exception as exc:
+                app.logger.error("Falha ao encerrar atendimento inativo: %s", _safe_error_label(exc))
+                scheduler.schedule(customer, expected_activity, delay_seconds=5)
+
+    scheduler = InactivityScheduler(close_inactive_service)
+
+    def refresh_inactivity(customer: str) -> None:
+        deadline = chatbot.inactivity_deadline(customer)
+        if deadline is None:
+            scheduler.cancel(customer)
+        else:
+            expected_activity, expires_at = deadline
+            scheduler.schedule(customer, expected_activity, expires_at)
+
     @app.get("/")
     def health() -> dict[str, str]:
         return {"status": "ok", "service": "castilla-whatsapp-bot"}
+
+    @app.get("/ready")
+    def readiness() -> tuple[Response, int]:
+        if isinstance(chatbot.storage, PrivateSqliteStorage):
+            try:
+                chatbot.storage.check_readiness()
+            except Exception as exc:
+                app.logger.error("Banco indisponível: %s", _safe_error_label(exc))
+                return jsonify({"status": "unavailable"}), 503
+        return jsonify({"status": "ready"}), 200
 
     @app.get("/webhook")
     def verify_webhook() -> Response:
@@ -113,26 +205,42 @@ def create_app(
             configured_app_secret,
         ):
             return jsonify({"error": "invalid signature"}), 401
-        payload = request.get_json(silent=True) or {}
-        # Em contas com coexistência, a Meta envia as mensagens digitadas no
-        # WhatsApp Business da escola em um evento distinto das do cliente.
-        for outgoing in _business_app_message_echoes(payload, configured_phone_number_id):
-            customer = _contact_id(outgoing["to"])
-            if customer:
-                completed = chatbot.attendant_message(customer, outgoing["text"]["body"])
-                if completed:
-                    app.logger.info("Atendimento humano encerrado pelo WhatsApp Business")
-        # A Meta pode agrupar mais de uma entrada/alteração/mensagem no evento.
-        for incoming in _text_messages(payload, configured_phone_number_id):
-            sender = _contact_id(incoming["from"])
-            if sender is None:
-                continue
-            message = incoming["text"]["body"]
-            reply = chatbot.receive(sender, message)
-            if reply is not None:
-                whatsapp_client.send_text(sender, reply)
-                if reply == HUMAN_DONE:
-                    app.logger.info("Aviso de passagem para atendente enviado")
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            return jsonify({"error": "invalid payload"}), 400
+        try:
+            # Em contas com coexistência, a Meta envia as mensagens digitadas no
+            # WhatsApp Business da escola em um evento distinto das do cliente.
+            for outgoing in _business_app_message_echoes(payload, configured_phone_number_id):
+                customer = _contact_id(outgoing["to"])
+                if customer:
+                    with contact_locks[hash(customer) % len(contact_locks)]:
+                        completed = chatbot.attendant_message(customer, outgoing["text"]["body"])
+                    if completed:
+                        app.logger.info("Atendimento humano encerrado pelo WhatsApp Business")
+            # A Meta pode agrupar mais de uma entrada/alteração/mensagem no evento.
+            for incoming in _text_messages(payload, configured_phone_number_id):
+                sender = _contact_id(incoming["from"])
+                if sender is None:
+                    continue
+                message_id = incoming.get("id")
+                if not isinstance(message_id, str):
+                    message_id = None
+                with contact_locks[hash(sender) % len(contact_locks)]:
+                    reply = chatbot.receive(sender, incoming["text"]["body"], message_id)
+                    if reply is not None:
+                        whatsapp_client.send_text(sender, reply)
+                        chatbot.reply_delivered(sender, message_id)
+                        if reply == HUMAN_DONE:
+                            app.logger.info("Aviso de passagem para atendente enviado")
+                    refresh_inactivity(sender)
+            for _ in _failed_delivery_statuses(payload, configured_phone_number_id):
+                app.logger.error("A Meta informou falha na entrega de uma mensagem")
+        except Exception as exc:
+            # Não confirme um lote que falhou: a Meta pode reenviá-lo. Não registre
+            # conteúdo, número de telefone ou tokens nos logs.
+            app.logger.error("Falha ao processar webhook: %s", _safe_error_label(exc))
+            return jsonify({"error": "temporary processing failure"}), 503
         # O recebimento deve ser confirmado mesmo quando o evento é só um status.
         return jsonify({"status": "received"}), 200
 
@@ -226,6 +334,24 @@ def _business_app_message_echoes(
     return echoes
 
 
+def _failed_delivery_statuses(
+    payload: dict[str, Any], phone_number_id: str = ""
+) -> list[dict[str, Any]]:
+    failed: list[dict[str, Any]] = []
+    for entry in payload.get("entry", []):
+        for change in entry.get("changes", []):
+            if change.get("field") not in (None, "messages"):
+                continue
+            value = change.get("value", {})
+            if not _for_business_number(value, phone_number_id):
+                continue
+            failed.extend(
+                status for status in value.get("statuses", [])
+                if isinstance(status, dict) and status.get("status") == "failed"
+            )
+    return failed
+
+
 def _for_business_number(value: dict[str, Any], phone_number_id: str) -> bool:
     if not phone_number_id:
         return True
@@ -237,6 +363,20 @@ def _contact_id(raw: str) -> str | None:
     if re.fullmatch(r"\+?[0-9]{8,15}", raw):
         return raw.removeprefix("+")
     return None
+
+
+def _safe_error_label(exc: Exception) -> str:
+    """Diagnóstico sem texto da Meta, URL, telefone ou credenciais."""
+    if isinstance(exc, requests.HTTPError) and exc.response is not None:
+        response = exc.response
+        try:
+            error = response.json().get("error", {})
+        except (ValueError, AttributeError):
+            error = {}
+        meta_code = error.get("code") if isinstance(error, dict) else None
+        code = meta_code if isinstance(meta_code, int) else "unknown"
+        return f"HTTPError status={response.status_code} meta_code={code}"
+    return type(exc).__name__
 
 
 def _valid_signature(body: bytes, received: str, app_secret: str) -> bool:

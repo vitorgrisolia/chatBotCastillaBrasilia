@@ -44,11 +44,14 @@ Menu de boas-vindas (opções restantes após cada consulta)
 A pré-matrícula solicita nome completo, endereço, e-mail, CPF e WhatsApp. Após
 a última resposta, o bot confirma o plano e o preço escolhidos e informa que um
 atendente entrará em contato para concluir a matrícula.
+CPF, formato do e-mail e número brasileiro de WhatsApp com DDD são validados
+antes de avançar. Isso não confirma que o e-mail ou o telefone pertencem ao aluno.
 
 ## Como funciona
 
 O `CastillaBot` processa uma mensagem por vez. Cada cliente é identificado por
-um `session_id`, associado a uma `Session` mantida em memória com:
+um `session_id`, associado a uma `Session` mantida em memória no modo de
+desenvolvimento ou no banco SQLite quando este for ativado, com:
 
 - a etapa atual da conversa;
 - os dados já coletados;
@@ -57,13 +60,19 @@ um `session_id`, associado a uma `Session` mantida em memória com:
 
 O estado atual seleciona a função responsável por tratar cada nova mensagem.
 Essa função valida a opção, atualiza a sessão e devolve a próxima resposta. Ao
-final, pré-matrículas e solicitações de atendimento são armazenadas como objetos
-JSON independentes em arquivos JSONL.
+final, pré-matrículas e solicitações de atendimento são armazenadas em JSONL
+no modo atual ou no banco privado quando este for ativado.
 
 No WhatsApp, a Meta envia eventos ao webhook Flask. A aplicação verifica a
 assinatura da requisição, extrai as mensagens de texto, utiliza o telefone do
 remetente como identificador da sessão, executa o núcleo de conversação e envia
 a resposta pela Graph API.
+
+Durante o fluxo automático, cada mensagem do cliente reinicia um temporizador
+de 30 segundos. Se não houver nova interação, o bot envia uma única mensagem de
+encerramento, limpa aquela sessão e começa um atendimento novo na próxima
+mensagem. O temporizador é cancelado ao entrar em atendimento humano: nessa
+etapa, o bot continua aguardando o encerramento escrito pelo atendente.
 
 Após encaminhar o cliente a um atendente, o bot envia uma única confirmação e
 permanece em silêncio, inclusive para `MENU` e `REINICIAR`. Se o número da
@@ -151,7 +160,9 @@ python -m unittest discover -s tests -v
 
 Os testes verificam a navegação pelos menus, respostas inválidas, persistência
 da pré-matrícula, atendimento humano, validação do webhook, assinaturas dos
-eventos, eventos de status e o comportamento da primeira mensagem.
+eventos, eventos de status, validação de contatos e o comportamento da primeira mensagem.
+Uma rotina de integração contínua também executará esses testes no GitHub após
+as mudanças serem enviadas ao repositório remoto.
 
 ## Dados gerados
 
@@ -235,6 +246,7 @@ Dockerfile); múltiplos processos exigem coordenação adicional.
 
 Veja o [roteiro de teste da passagem para o atendente](docs/teste-passagem-atendente.md)
 antes de liberar esse fluxo em produção.
+Veja também os [critérios críticos de lançamento da 1.0](docs/criterios-lancamento-v1.md).
 
 ## Publicar o webhook local com Cloudflare Tunnel
 
@@ -316,11 +328,10 @@ Esta versão foi mantida propositalmente simples e é adequada para demonstraç�
 aprendizado e validação inicial do negócio. Antes de ampliar seu uso em
 produção, as principais melhorias planejadas são:
 
-- sessões persistentes em PostgreSQL ou Redis;
-- banco de dados com criptografia e controle de acesso aos dados dos clientes;
-- validação de CPF, e-mail e telefone;
+- ativar o SQLite privado e migrar os dados existentes com conferência;
+- backup externo, restauração testada e controle de acesso aos dados dos clientes;
 - logs estruturados, monitoramento e acompanhamento de entrega;
-- novas tentativas e idempotência nas chamadas da Graph API;
+- acompanhar falhas e reenvios da Graph API em operação real;
 - hospedagem permanente com domínio HTTPS estável;
 - painel administrativo para leads e solicitações de atendimento.
 
