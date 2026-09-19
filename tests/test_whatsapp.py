@@ -301,6 +301,34 @@ class WhatsAppWebhookTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 404)
 
+    def test_dotenv_is_loaded_only_for_real_runtime(self):
+        with patch("castilla_bot.whatsapp.load_dotenv") as dotenv_loader:
+            create_app(
+                bot=CastillaBot(JsonlStorage(self.temp_dir.name)),
+                client=FakeWhatsAppClient(),
+            )
+            dotenv_loader.assert_not_called()
+
+        environment = {
+            "WHATSAPP_VERIFY_TOKEN": "verify-test",
+            "WHATSAPP_ACCESS_TOKEN": "access-test",
+            "WHATSAPP_PHONE_NUMBER_ID": "phone-test",
+            "META_APP_SECRET": "secret-test",
+            "META_GRAPH_API_VERSION": "v23.0",
+        }
+        with (
+            patch("castilla_bot.whatsapp.load_dotenv") as dotenv_loader,
+            patch(
+                "castilla_bot.whatsapp._configuration_from_environment",
+                return_value=environment,
+            ),
+        ):
+            create_app(
+                bot=CastillaBot(JsonlStorage(self.temp_dir.name)),
+                client=None,
+            )
+            dotenv_loader.assert_called_once_with(override=False)
+
     def test_production_refuses_legacy_storage(self):
         with patch.dict("os.environ", {"CASTILLA_ENV": "production"}):
             with self.assertRaisesRegex(RuntimeError, "SQLite privado"):

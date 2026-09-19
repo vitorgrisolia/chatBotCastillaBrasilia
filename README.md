@@ -18,9 +18,13 @@ stable customer ID and exchanging text messages.
 - Separate sessions for multiple concurrent customers.
 - Course, methodology, pricing, student support, and human handoff flows.
 - Pre-enrollment collection with the selected plan and price.
+- CPF, email-format, and Brazilian WhatsApp-number validation.
 - Official WhatsApp Cloud API integration through a Flask webhook.
 - Meta webhook verification and HMAC-SHA256 request signature validation.
-- Thread-safe JSON Lines persistence for pre-enrollments and support requests.
+- Private SQLite persistence for records and sessions in production mode.
+- Duplicate-event protection and safe retries after observable Meta failures.
+- Automatic-flow closure after 30 seconds without customer interaction.
+- Controlled JSONL migration, encrypted backups, and 20-day retention.
 - Dependency injection for isolated bot and webhook testing.
 - Docker support and a production WSGI configuration with Gunicorn.
 - Automated tests covering the conversation and WhatsApp webhook behavior.
@@ -50,8 +54,8 @@ area code before advancing. These checks do not verify ownership of the contacts
 ## How it works
 
 `CastillaBot` processes one message at a time. Each customer is identified by a
-`session_id`, which maps to a `Session` held in memory by default or persisted
-in private SQLite storage when enabled, containing:
+`session_id`, which maps to a `Session` held in memory in legacy JSONL mode or
+persisted in private SQLite storage when the `sqlite` backend is active, containing:
 
 - the current conversation state;
 - the data already collected;
@@ -61,7 +65,7 @@ in private SQLite storage when enabled, containing:
 The active state selects the appropriate handler for each incoming message. The
 handler validates the menu option, updates the session, and returns the next
 text response. Completed pre-enrollments and human-support requests are written
-to JSONL by default or to private SQLite storage when enabled.
+to JSONL in development mode or to private SQLite storage in production mode.
 
 For WhatsApp, Meta sends events to the Flask webhook. The application verifies
 the request signature, extracts incoming text messages, uses the sender's phone
@@ -101,16 +105,23 @@ the customer completes the form; cancelling it with `MENU` keeps it available.
 
 ```text
 castilla_bot/
-├── bot.py          # Conversation states, menus, and business rules
-├── cli.py          # Local terminal interface
-├── storage.py      # Thread-safe JSONL persistence
-├── whatsapp.py     # Flask webhook and Meta Graph API client
+├── bot.py              # Conversation states, timer, menus, and business rules
+├── cli.py              # Local terminal interface
+├── private_storage.py  # Private SQLite, backup, migration, and retention
+├── privacy_admin.py    # Local data-administration commands
+├── storage.py          # Legacy JSONL persistence for development
+├── validation.py       # CPF, email, and WhatsApp validation
+├── whatsapp.py         # Flask webhook and Meta Graph API client
 └── __init__.py
 tests/
 ├── test_bot.py
+├── test_private_storage.py
+├── test_validation.py
 └── test_whatsapp.py
+.github/workflows/ci.yml # Automated tests on GitHub
 .env.exemple        # Environment variable template
 Dockerfile          # Container image for deployment
+fly.toml.example    # Permanent-hosting configuration template
 pyproject.toml      # Package metadata and dependencies
 ```
 
@@ -157,25 +168,27 @@ to request human support, or `SAIR` to close the application.
 python -m unittest discover -s tests -v
 ```
 
-The test suite covers menu navigation, invalid input, pre-enrollment
-persistence, human handoff, webhook verification, webhook signatures, status
-events, and the first-message behavior.
+The project has 43 automated cases covering menus, invalid input, contact
+validation, private storage, migration, backup, retention, duplicate events,
+Meta failures, inactivity timeout, human handoff, and restart behavior with
+persistent sessions. Continuous integration runs them on Windows and Linux.
 
-## Generated data
+## Database and customer-data protection
 
-An optional private SQLite storage layer, legacy-record review, encrypted
-backups, and 20-day retention for unconverted pre-enrollments are being
-prepared for version 1.0. They are **not enabled automatically** and do not
-delete existing files. See the [data-protection plan](docs/protecao-de-dados-v1.md)
-(in Portuguese).
+Production mode stores records and sessions in
+`data/private/castilla.sqlite3`. The private directory has restricted
+permissions and is excluded from Git because it contains personal information.
 
-The local storage layer writes records to:
+Legacy JSONL files remain available after migration for review and recovery.
+Do not delete them until record counts, an encrypted backup, and a restore have
+all been verified. Imported pre-enrollments start as `needs_review`; after
+review, they can be marked converted or unconverted. Only unconverted records
+enter the school's 20-day retention process.
 
-- `data/pre_matriculas.jsonl` for pre-enrollment requests;
-- `data/atendimentos.jsonl` for human-support requests.
-
-Each line is an independent UTF-8 JSON object. These generated files are
-excluded from Git because they may contain personal information.
+Administrative commands create and verify encrypted backups, never overwrite
+an existing backup, and are not exposed through the webhook. Read the
+[data-protection plan](docs/protecao-de-dados-v1.md) (in Portuguese) before
+migrating records, changing statuses, or applying retention.
 
 ## WhatsApp Business setup
 
@@ -201,22 +214,30 @@ WHATSAPP_PHONE_NUMBER_ID=your-whatsapp-phone-number-id
 META_APP_SECRET=your-meta-application-secret
 META_GRAPH_API_VERSION=v23.0
 OPERATOR_TOKEN=create-a-long-random-secret-here
+CASTILLA_ENV=production
+CASTILLA_STORAGE_BACKEND=sqlite
+CASTILLA_DB_PATH=data/private/castilla.sqlite3
+CASTILLA_INACTIVITY_SECONDS=30
+CASTILLA_BACKUP_KEY=your-44-character-fernet-key
 ```
 
 Never commit the populated `.env` file or expose its values in screenshots,
-logs, or documentation.
+logs, or documentation. The Fernet key ends with `=`, must not contain extra
+spaces, and should be stored separately from backup files.
 
-6. Start the webhook:
+6. For development without Docker, start the webhook directly:
 
 ```powershell
 python -m castilla_bot.whatsapp
 ```
 
+Normal container execution is documented in [Docker](#docker). Do not run the
+Python webhook and the container at the same time.
+
 The default port is `8000`. It can be changed through the `PORT` environment
-variable. `GET /` checks the process and `GET /ready` checks database access
-when SQLite is enabled. Production mode (`CASTILLA_ENV=production`) refuses
-legacy JSONL storage. `GET /webhook` and
-`POST /webhook` verify and receive Meta events.
+variable. `GET /` checks the process, `GET /ready` checks database access, and
+`GET /webhook` and `POST /webhook` verify and receive Meta events. Production
+mode (`CASTILLA_ENV=production`) refuses legacy JSONL storage.
 
 To close service from WhatsApp Business itself, set up App/Cloud API
 coexistence and subscribe the webhook to `smb_message_echoes`. The attendant
@@ -250,13 +271,9 @@ See the [critical 1.0 release criteria](docs/criterios-lancamento-v1.md).
 
 A Cloudflare Quick Tunnel provides a temporary HTTPS URL for development and
 demonstrations. Its `trycloudflare.com` address changes whenever the tunnel is
-restarted and should not be used as a production endpoint.
-
-Keep the bot running in the first PowerShell window:
-
-```powershell
-python -m castilla_bot.whatsapp
-```
+restarted and should not be used as a production endpoint. First keep exactly
+one bot instance running — either the container or direct Python execution —
+and confirm that `http://127.0.0.1:8000/ready` returns `ready`.
 
 In a second PowerShell window, check whether `cloudflared` is available:
 
@@ -294,14 +311,16 @@ Configure the following callback URL in Meta:
 https://random-words.trycloudflare.com/webhook
 ```
 
-Use the exact value from `WHATSAPP_VERIFY_TOKEN` as the verification token and
-subscribe the webhook to the `messages` field. Both PowerShell windows must
-remain open during local testing.
+Use the exact value from `WHATSAPP_VERIFY_TOKEN` as the verification token.
+Subscribe to `messages` and, to recognize `atendimento finalizado` typed in the
+school's WhatsApp Business app, also confirm `smb_message_echoes`. The container
+and tunnel must remain active during local testing.
 
 Common issues:
 
 - **`cloudflared` is not recognized:** reopen PowerShell or use the full path.
-- **HTTP 502:** confirm that the Python webhook is running on port `8000`.
+- **HTTP 502:** confirm that either the container or the Python webhook is
+  responding on port `8000`.
 - **DNS timeout or connection failure:** keep `--protocol http2`, disable the
   VPN for the test, and verify outbound firewall access.
 - **Meta cannot validate the webhook:** check the `/webhook` suffix and ensure
@@ -309,29 +328,50 @@ Common issues:
 
 ## Docker
 
-Build and run the container after configuring the required environment
-variables:
+Build the image after configuring the required environment variables:
 
 ```powershell
 docker build -t castilla-bot .
-docker run --rm -p 8000:8000 --env-file .env castilla-bot
 ```
 
-The container runs Gunicorn with one worker and exposes port `8000`.
+The database must remain outside the disposable container. Mount the project's
+`data` directory before starting it:
+
+```powershell
+$castillaDataDir = (Resolve-Path ".\data").Path
+
+docker run --rm --name castilla-bot `
+  -p 8000:8000 `
+  --env-file ".env" `
+  --mount "type=bind,source=$castillaDataDir,target=/app/data" `
+  castilla-bot
+```
+
+Without the mount, SQLite would live inside the container and be lost when the
+container is removed. The container runs Gunicorn with one worker and exposes
+port `8000`. Do not run `python -m castilla_bot.whatsapp` at the same time.
+
+Check readiness from another PowerShell window:
+
+```powershell
+Invoke-RestMethod "http://127.0.0.1:8000/ready"
+```
 
 ## Current scope and next steps
 
-This version is intentionally lightweight and suitable for demonstrations,
-learning, and initial business validation. Before scaling it for production,
-the main planned improvements are:
+The main flow, private SQLite storage, validation, duplicate-event protection,
+observable-failure handling, and inactivity timer are implemented. The
+remaining development work for version 1.0 is:
 
-- persistent session storage, such as PostgreSQL or Redis;
-- a database with encryption and access controls for customer data;
-- CPF, email, and phone-number validation;
-- structured logs, monitoring, and delivery-status tracking;
-- retries and idempotency for Graph API requests;
-- a permanent deployment and stable HTTPS domain;
-- an administrative dashboard for leads and support requests.
+- a restricted dashboard for bot, database, webhook, and Meta-failure health;
+- restoring automatic timers after a container restart;
+- an administrative panel for pre-enrollments and support requests;
+- structured logs, external alerts, and delivery-status monitoring;
+- an operational backup, restore, and retention routine with an audit trail;
+- full testing with the school's real account, then version and changelog updates.
+
+Permanent hosting and a stable HTTPS endpoint remain operational requirements
+for replacing the Quick Tunnel in production.
 
 ## Security considerations
 

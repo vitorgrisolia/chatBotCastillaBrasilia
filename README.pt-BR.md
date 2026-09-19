@@ -19,9 +19,13 @@ identificação estável do cliente e trocar mensagens de texto.
 - Sessões separadas para vários clientes simultâneos.
 - Fluxos de curso, metodologia, planos, suporte ao aluno e atendimento humano.
 - Coleta de pré-matrícula com o plano e o valor escolhidos.
+- Validação de CPF, formato de e-mail e WhatsApp brasileiro com DDD.
 - Integração com a API oficial WhatsApp Cloud por meio de um webhook Flask.
 - Verificação do webhook da Meta e validação de assinatura HMAC-SHA256.
-- Persistência em JSON Lines com proteção contra gravações simultâneas.
+- Persistência de cadastros e sessões em banco SQLite privado no modo de produção.
+- Prevenção de mensagens duplicadas e reenvio seguro após falhas observáveis da Meta.
+- Encerramento do atendimento automático após 30 segundos sem interação.
+- Migração controlada dos arquivos JSONL, backup cifrado e retenção de 20 dias.
 - Injeção de dependências para testes isolados do bot e do webhook.
 - Suporte a Docker e execução em produção com Gunicorn.
 - Testes automatizados do fluxo de conversa e da integração com o WhatsApp.
@@ -50,8 +54,8 @@ antes de avançar. Isso não confirma que o e-mail ou o telefone pertencem ao al
 ## Como funciona
 
 O `CastillaBot` processa uma mensagem por vez. Cada cliente é identificado por
-um `session_id`, associado a uma `Session` mantida em memória no modo de
-desenvolvimento ou no banco SQLite quando este for ativado, com:
+um `session_id`, associado a uma `Session` mantida em memória no modo JSONL ou
+persistida no banco SQLite privado quando o backend `sqlite` está ativo, com:
 
 - a etapa atual da conversa;
 - os dados já coletados;
@@ -61,7 +65,7 @@ desenvolvimento ou no banco SQLite quando este for ativado, com:
 O estado atual seleciona a função responsável por tratar cada nova mensagem.
 Essa função valida a opção, atualiza a sessão e devolve a próxima resposta. Ao
 final, pré-matrículas e solicitações de atendimento são armazenadas em JSONL
-no modo atual ou no banco privado quando este for ativado.
+no modo de desenvolvimento ou no banco privado no modo de produção.
 
 No WhatsApp, a Meta envia eventos ao webhook Flask. A aplicação verifica a
 assinatura da requisição, extrai as mensagens de texto, utiliza o telefone do
@@ -99,16 +103,23 @@ uma interface integrada à rota protegida `POST /operator/complete`.
 
 ```text
 castilla_bot/
-├── bot.py          # Estados da conversa, menus e regras de negócio
-├── cli.py          # Interface local de terminal
-├── storage.py      # Persistência JSONL segura entre threads
-├── whatsapp.py     # Webhook Flask e cliente da Graph API da Meta
+├── bot.py              # Estados, menus, temporizador e regras de negócio
+├── cli.py              # Interface local de terminal
+├── private_storage.py  # SQLite privado, backup, migração e retenção
+├── privacy_admin.py    # Administração local e segura dos dados
+├── storage.py          # Persistência JSONL legada para desenvolvimento
+├── validation.py       # Validação de CPF, e-mail e WhatsApp
+├── whatsapp.py         # Webhook Flask e cliente da Graph API da Meta
 └── __init__.py
 tests/
 ├── test_bot.py
+├── test_private_storage.py
+├── test_validation.py
 └── test_whatsapp.py
+.github/workflows/ci.yml # Testes automáticos no GitHub
 .env.exemple        # Modelo das variáveis de ambiente
 Dockerfile          # Imagem de contêiner para publicação
+fly.toml.example    # Modelo de hospedagem permanente
 pyproject.toml      # Metadados e dependências do pacote
 ```
 
@@ -158,26 +169,29 @@ menu antes de concluir, ela continua disponível.
 python -m unittest discover -s tests -v
 ```
 
-Os testes verificam a navegação pelos menus, respostas inválidas, persistência
-da pré-matrícula, atendimento humano, validação do webhook, assinaturas dos
-eventos, eventos de status, validação de contatos e o comportamento da primeira mensagem.
-Uma rotina de integração contínua também executará esses testes no GitHub após
-as mudanças serem enviadas ao repositório remoto.
+O projeto possui 43 casos automatizados para menus, respostas inválidas,
+validação de contatos, banco privado, migração, backup, retenção, mensagens
+duplicadas, falhas da Meta, temporizador, passagem ao atendente e reinício com
+sessões persistentes. A rotina de integração contínua executa esses testes em
+Windows e Linux quando as mudanças são enviadas ao GitHub.
 
-## Dados gerados
+## Banco de dados e proteção dos cadastros
 
-Uma camada opcional de banco SQLite privado, revisão de cadastros antigos,
-backup cifrado e retenção de pré-matrículas pendentes por 20 dias está em
-preparação para a versão 1.0. Ela **não é ativada automaticamente** e não apaga
-os arquivos existentes. Veja [Proteção de dados — versão 1.0](docs/protecao-de-dados-v1.md).
+No modo de produção, cadastros e sessões são armazenados em
+`data/private/castilla.sqlite3`. O diretório recebe permissões restritas e é
+ignorado pelo Git porque contém informações pessoais.
 
-A persistência local grava os registros em:
+Os arquivos JSONL antigos continuam preservados após a migração para permitir
+conferência e recuperação. Eles não devem ser apagados até que as contagens, o
+backup cifrado e uma restauração tenham sido verificados. Pré-matrículas antigas
+entram como `needs_review`; depois da conferência, podem ser marcadas como
+convertidas ou não convertidas. Somente as não convertidas entram na retenção de
+20 dias definida pela escola.
 
-- `data/pre_matriculas.jsonl` para solicitações de pré-matrícula;
-- `data/atendimentos.jsonl` para solicitações de atendimento humano.
-
-Cada linha contém um objeto JSON independente em UTF-8. Esses arquivos são
-ignorados pelo Git porque podem conter informações pessoais.
+Os comandos administrativos criam e verificam backups cifrados, nunca
+sobrescrevem uma cópia existente e não ficam expostos pelo webhook. Consulte
+[Proteção de dados — versão 1.0](docs/protecao-de-dados-v1.md) antes de migrar,
+alterar status ou executar a retenção.
 
 ## Configurar o WhatsApp Business
 
@@ -204,20 +218,30 @@ WHATSAPP_PHONE_NUMBER_ID=id-do-numero-do-whatsapp
 META_APP_SECRET=chave-secreta-do-aplicativo-meta
 META_GRAPH_API_VERSION=v23.0
 OPERATOR_TOKEN=crie-um-token-longo-e-aleatorio-aqui
+CASTILLA_ENV=production
+CASTILLA_STORAGE_BACKEND=sqlite
+CASTILLA_DB_PATH=data/private/castilla.sqlite3
+CASTILLA_INACTIVITY_SECONDS=30
+CASTILLA_BACKUP_KEY=chave-fernet-de-44-caracteres
 ```
 
 Nunca envie o `.env` preenchido ao Git nem exponha seus valores em capturas de
-tela, logs ou documentos.
+tela, logs ou documentos. A chave Fernet termina com `=`, não pode conter
+espaços extras e deve ser guardada separadamente dos arquivos de backup.
 
-6. Inicie o webhook:
+6. Para desenvolvimento sem Docker, inicie o webhook diretamente:
 
 ```powershell
 python -m castilla_bot.whatsapp
 ```
 
+A execução normal pelo contêiner está descrita na seção [Docker](#docker). Não
+execute o webhook pelo Python e pelo contêiner ao mesmo tempo.
+
 A porta padrão é `8000` e pode ser alterada pela variável `PORT`. A rota
-`GET /` verifica a saúde do serviço; `GET /webhook` e `POST /webhook` verificam
-e recebem os eventos da Meta.
+`GET /` verifica o processo, `GET /ready` confirma o acesso ao banco e
+`GET /webhook` e `POST /webhook` verificam e recebem os eventos da Meta. Quando
+`CASTILLA_ENV=production`, a aplicação recusa o backend JSONL.
 
 Para encerrar pelo próprio WhatsApp Business, configure a coexistência da conta
 com a Cloud API e inscreva o webhook no campo `smb_message_echoes`. A frase
@@ -252,13 +276,9 @@ Veja também os [critérios críticos de lançamento da 1.0](docs/criterios-lanc
 
 O Cloudflare Quick Tunnel fornece uma URL HTTPS temporária para desenvolvimento
 e demonstrações. O endereço `trycloudflare.com` muda sempre que o túnel é
-reiniciado e não deve ser utilizado em produção.
-
-Mantenha o bot em execução na primeira janela do PowerShell:
-
-```powershell
-python -m castilla_bot.whatsapp
-```
+reiniciado e não deve ser utilizado em produção. Primeiro deixe uma única
+instância do bot funcionando — pelo contêiner ou diretamente pelo Python — e
+confirme que `http://127.0.0.1:8000/ready` retorna `ready`.
 
 Em uma segunda janela, verifique se o `cloudflared` está disponível:
 
@@ -296,16 +316,17 @@ Configure no painel da Meta a seguinte URL de callback:
 https://palavras-aleatorias.trycloudflare.com/webhook
 ```
 
-Utilize exatamente o valor de `WHATSAPP_VERIFY_TOKEN` como token de verificação
-e assine o webhook no campo `messages`. As duas janelas do PowerShell precisam
-permanecer abertas durante os testes locais.
+Utilize exatamente o valor de `WHATSAPP_VERIFY_TOKEN` como token de verificação.
+Assine o campo `messages` e, para reconhecer `atendimento finalizado` digitado
+no WhatsApp Business da escola, confirme também `smb_message_echoes`. O
+contêiner e o túnel precisam permanecer ativos durante os testes locais.
 
 Problemas comuns:
 
 - **`cloudflared` não reconhecido:** reabra o PowerShell ou utilize o caminho
   completo do executável.
-- **Erro HTTP 502:** confirme que o webhook Python está executando na porta
-  `8000`.
+- **Erro HTTP 502:** confirme que o contêiner ou o webhook Python está
+  respondendo na porta `8000`.
 - **Timeout de DNS ou falha de conexão:** mantenha `--protocol http2`, desligue
   a VPN durante o teste e confira as permissões de saída do firewall.
 - **A Meta não valida o webhook:** confira o sufixo `/webhook` e confirme que o
@@ -313,27 +334,50 @@ Problemas comuns:
 
 ## Docker
 
-Depois de configurar as variáveis de ambiente, construa e execute o contêiner:
+Depois de configurar as variáveis de ambiente, construa a imagem:
 
 ```powershell
 docker build -t castilla-bot .
-docker run --rm -p 8000:8000 --env-file .env castilla-bot
 ```
 
-O contêiner utiliza Gunicorn com um processo e expõe a porta `8000`.
+O banco precisa permanecer fora do contêiner. No PowerShell, monte a pasta
+`data` do projeto antes de iniciar:
+
+```powershell
+$castillaDataDir = (Resolve-Path ".\data").Path
+
+docker run --rm --name castilla-bot `
+  -p 8000:8000 `
+  --env-file ".env" `
+  --mount "type=bind,source=$castillaDataDir,target=/app/data" `
+  castilla-bot
+```
+
+Sem o `--mount`, o SQLite ficaria dentro do contêiner e seria perdido quando o
+contêiner fosse removido. O contêiner utiliza Gunicorn com um processo e expõe
+a porta `8000`. Não execute simultaneamente `python -m castilla_bot.whatsapp`.
+
+Em outro PowerShell, confirme a prontidão:
+
+```powershell
+Invoke-RestMethod "http://127.0.0.1:8000/ready"
+```
 
 ## Escopo atual e próximos passos
 
-Esta versão foi mantida propositalmente simples e é adequada para demonstração,
-aprendizado e validação inicial do negócio. Antes de ampliar seu uso em
-produção, as principais melhorias planejadas são:
+O fluxo principal, o SQLite privado, as validações, a proteção contra eventos
+duplicados, o tratamento de falhas observáveis e o temporizador já estão
+implementados. Para fechar o desenvolvimento da versão 1.0, permanecem:
 
-- ativar o SQLite privado e migrar os dados existentes com conferência;
-- backup externo, restauração testada e controle de acesso aos dados dos clientes;
-- logs estruturados, monitoramento e acompanhamento de entrega;
-- acompanhar falhas e reenvios da Graph API em operação real;
-- hospedagem permanente com domínio HTTPS estável;
-- painel administrativo para leads e solicitações de atendimento.
+- dashboard restrito para saúde do bot, banco, webhook e falhas da Meta;
+- restauração dos temporizadores automáticos após reinício do contêiner;
+- painel administrativo para pré-matrículas e solicitações de atendimento;
+- logs estruturados, alertas externos e acompanhamento de entrega;
+- rotina operacional de backup, restauração e retenção com registro das ações;
+- teste completo na conta real da escola, atualização da versão e changelog.
+
+A hospedagem permanente e o endereço HTTPS estável continuam sendo requisitos
+operacionais para substituir o Quick Tunnel em produção.
 
 ## Considerações de segurança
 

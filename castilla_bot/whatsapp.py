@@ -19,11 +19,6 @@ from .bot import CastillaBot, HUMAN_DONE, INACTIVITY_DONE
 from .private_storage import PrivateSqliteStorage
 
 
-# O arquivo .env é a fonte de configuração deste projeto. Isso evita que valores
-# antigos deixados no PowerShell prevaleçam após uma edição das credenciais.
-load_dotenv(override=True)
-
-
 class WhatsAppClient:
     """Cliente mínimo para enviar mensagens de texto pela Graph API."""
 
@@ -116,6 +111,12 @@ def create_app(
     phone_number_id: str | None = None,
 ) -> Flask:
     """Cria a aplicação Flask; parâmetros opcionais facilitam os testes."""
+
+    # A aplicação real aceita o .env como configuração local, mas variáveis
+    # fornecidas pelo Docker ou pela hospedagem têm prioridade. Testes que
+    # injetam um cliente simulado não carregam credenciais nem modo de produção.
+    if client is None:
+        load_dotenv(override=False)
 
     app = Flask(__name__)
     app.logger.setLevel(logging.INFO)
