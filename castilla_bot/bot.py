@@ -439,9 +439,12 @@ class CastillaBot:
 
         record = self._record(session.data)
         self.storage.save("pre_matriculas", record)
+        plan = session.data["plano"]
+        # O cadastro já está no armazenamento; a sessão não precisa guardar dados pessoais.
+        session.data = {}
+        session.field_index = 0
         session.selected_options.add("4")
         session.state = "main"
-        plan = session.data["plano"]
         return f"""✅ Pré-matrícula recebida!
 
 Plano escolhido: {plan}
@@ -481,6 +484,7 @@ Obrigado por escolher o Castilla Idiomas Brasília! 📚✨
 
     def _save_human(self, session: Session) -> str:
         self.storage.save("atendimentos", self._record(session.data))
+        session.data = {}
         session.state = "human_pending"
         return HUMAN_DONE
 

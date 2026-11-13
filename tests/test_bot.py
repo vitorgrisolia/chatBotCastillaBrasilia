@@ -4,7 +4,15 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from castilla_bot.bot import CastillaBot, INACTIVITY_DONE, INVALID, PRE_ENROLLMENT_FIELDS, WELCOME
+from castilla_bot.bot import (
+    CastillaBot,
+    INACTIVITY_DONE,
+    INVALID,
+    PRE_ENROLLMENT_FIELDS,
+    WELCOME,
+    PendingDelivery,
+)
+from castilla_bot.private_storage import PrivateSqliteStorage
 from castilla_bot.storage import JsonlStorage
 
 
@@ -170,6 +178,85 @@ class CastillaBotTests(unittest.TestCase):
         self.assertIsNone(bot.inactivity_deadline("human-client"))
         now[0] += timedelta(hours=1)
         self.assertIsNone(bot.receive("human-client", "Ainda aguardando", "human-5"))
+
+
+class SessionPrivacyTests(unittest.TestCase):
+    PERSONAL_ANSWERS = (
+        "Maria da Silva",
+        "Rua Central, 10",
+        "maria@example.com",
+        "529.982.247-25",
+        "(61) 99999-9999",
+    )
+    PERSONAL_VALUES = (
+        "Maria da Silva",
+        "Rua Central, 10",
+        "maria@example.com",
+        "52998224725",
+        "5561999999999",
+    )
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.database = Path(self.temp_dir.name) / "private" / "castilla.sqlite3"
+        self.storage = PrivateSqliteStorage(self.database)
+        self.bot = CastillaBot(self.storage)
+        self.session = "cliente-privacidade"
+        self.counter = 0
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def _send(self, message):
+        self.counter += 1
+        message_id = f"m{self.counter}"
+        reply = self.bot.receive(self.session, message, message_id)
+        if reply is not None:
+            self.bot.reply_delivered(self.session, message_id)
+        return reply
+
+    def _assert_session_has_no_personal_data(self):
+        saved = PrivateSqliteStorage(self.database).load_session(self.session)
+        self.assertEqual(saved["data"], {})
+        self.assertEqual(saved["field_index"], 0)
+        for value in self.PERSONAL_VALUES:
+            self.assertNotIn(value, str(saved))
+
+    def test_completed_pre_enrollment_is_saved_but_not_kept_in_session(self):
+        for message in ("Olá", "4", "2", *self.PERSONAL_ANSWERS):
+            reply = self._send(message)
+        self.assertIn("Pré-matrícula recebida", reply)
+
+        self.bot = CastillaBot(PrivateSqliteStorage(self.database))
+        self.assertEqual(self.bot.storage.counts(), {"pre_matriculas:pending": 1})
+        self._assert_session_has_no_personal_data()
+        self.assertIn("curso de inglês", self._send("1"))
+
+    def test_failed_confirmation_delivery_can_be_retried(self):
+        for message in ("Olá", "4", "2", *self.PERSONAL_ANSWERS[:-1]):
+            self._send(message)
+        confirmation = self.bot.receive(self.session, self.PERSONAL_ANSWERS[-1], "final")
+        self.assertIn("Pré-matrícula recebida", confirmation)
+
+        # Simula reinício do processo antes de confirmar o envio.
+        self.bot = CastillaBot(PrivateSqliteStorage(self.database))
+        self._assert_session_has_no_personal_data()
+        with self.assertRaises(PendingDelivery):
+            self.bot.receive(self.session, "1", "outra")
+        self.assertEqual(
+            self.bot.receive(self.session, self.PERSONAL_ANSWERS[-1], "final"), confirmation
+        )
+        self.bot.reply_delivered(self.session, "final")
+        self.assertIsNone(self.bot.receive(self.session, self.PERSONAL_ANSWERS[-1], "final"))
+        self.assertEqual(self.bot.storage.counts(), {"pre_matriculas:pending": 1})
+
+    def test_human_handoff_does_not_keep_name_and_subject_in_session(self):
+        for message in ("Olá", "6", "Maria da Silva", "Dúvida sobre boleto"):
+            self._send(message)
+        saved = PrivateSqliteStorage(self.database).load_session(self.session)
+        self.assertEqual(saved["state"], "human_pending")
+        self.assertEqual(saved["data"], {})
+        self.assertEqual(self.storage.counts(), {"atendimentos:not_applicable": 1})
 
 
 if __name__ == "__main__":
