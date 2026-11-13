@@ -15,7 +15,7 @@ import subprocess
 from contextlib import closing, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Iterator
+from typing import Iterator, Sequence
 from uuid import uuid4
 
 from cryptography.fernet import Fernet
@@ -102,13 +102,29 @@ class PrivateSqliteStorage:
             ).fetchone()
         return json.loads(row["state"]) if row else None
 
+    def session_ids(self) -> list[str]:
+        with self._connect() as connection:
+            rows = connection.execute("SELECT session_id FROM sessions").fetchall()
+        return [row["session_id"] for row in rows]
+
     def check_readiness(self) -> None:
         """Falha se o banco ou a tabela de sessões não estiver acessível."""
         with self._connect() as connection:
             connection.execute("SELECT 1 FROM sessions LIMIT 1").fetchone()
 
-    def save_session(self, session_id: str, state: dict[str, object]) -> None:
+    def save_session(
+        self,
+        session_id: str,
+        state: dict[str, object],
+        *,
+        records: Sequence[tuple[str, dict[str, object]]] = (),
+    ) -> list[str]:
+        """Grava a sessão e, na mesma transação, os registros criados no evento."""
         with self._connect() as connection:
+            record_ids = [
+                self._insert_record(connection, collection, record)
+                for collection, record in records
+            ]
             connection.execute(
                 """INSERT INTO sessions (session_id, state, updated_at)
                 VALUES (?, ?, ?)
@@ -120,6 +136,7 @@ class PrivateSqliteStorage:
                     datetime.now(timezone.utc).isoformat(),
                 ),
             )
+        return record_ids
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -132,25 +149,31 @@ class PrivateSqliteStorage:
             connection.close()
 
     def save(self, collection: str, record: dict[str, object]) -> str:
+        with self._connect() as connection:
+            return self._insert_record(connection, collection, record)
+
+    @staticmethod
+    def _insert_record(
+        connection: sqlite3.Connection, collection: str, record: dict[str, object]
+    ) -> str:
         if collection not in COLLECTIONS:
             raise ValueError("Coleção de dados não permitida")
         moment = _received_at(record)
         status = "pending" if collection == "pre_matriculas" else "not_applicable"
         record_id = uuid4().hex
-        with self._connect() as connection:
-            connection.execute(
-                """INSERT INTO records
-                (id, collection, payload, received_at, received_at_unix, status)
-                VALUES (?, ?, ?, ?, ?, ?)""",
-                (
-                    record_id,
-                    collection,
-                    json.dumps(record, ensure_ascii=False),
-                    moment.isoformat(),
-                    int(moment.timestamp()),
-                    status,
-                ),
-            )
+        connection.execute(
+            """INSERT INTO records
+            (id, collection, payload, received_at, received_at_unix, status)
+            VALUES (?, ?, ?, ?, ?, ?)""",
+            (
+                record_id,
+                collection,
+                json.dumps(record, ensure_ascii=False),
+                moment.isoformat(),
+                int(moment.timestamp()),
+                status,
+            ),
+        )
         return record_id
 
     @staticmethod

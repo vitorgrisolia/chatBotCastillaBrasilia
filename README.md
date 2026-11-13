@@ -22,7 +22,7 @@ stable customer ID and exchanging text messages.
 - Official WhatsApp Cloud API integration through a Flask webhook.
 - Meta webhook verification and HMAC-SHA256 request signature validation.
 - Private SQLite persistence for records and sessions in production mode.
-- Duplicate-event protection and safe retries after observable Meta failures.
+- Duplicate-event protection and retries after observable Meta failures. If Meta delivers a message but the confirmation is lost, the customer may receive it twice.
 - Automatic-flow closure after 30 seconds without customer interaction.
 - Controlled JSONL migration, encrypted backups, and 20-day retention.
 - Dependency injection for isolated bot and webhook testing.
@@ -119,259 +119,28 @@ tests/
 ├── test_validation.py
 └── test_whatsapp.py
 .github/workflows/ci.yml # Automated tests on GitHub
-.env.exemple        # Environment variable template
+.env.example        # Development environment variable template
+constraints.txt     # Pinned dependency versions for Docker and CI
 Dockerfile          # Container image for deployment
+docker-entrypoint.sh # Prepares the database folder and drops root privileges
 fly.toml.example    # Permanent-hosting configuration template
 pyproject.toml      # Package metadata and dependencies
 ```
 
-## Run locally
-
-### Requirements
-
-- Python 3.10 or later
-- Git
-
-Clone the repository and enter the project directory:
-
-```powershell
-git clone https://github.com/vitorgrisolia/chatBtoCastillaBrasilia.git
-cd chatBtoCastillaBrasilia
-```
-
-Create and activate a virtual environment on Windows:
-
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-```
-
-Install the project:
-
-```powershell
-python -m pip install --upgrade pip
-python -m pip install -e .
-```
-
-Start the terminal demonstration:
-
-```powershell
-python -m castilla_bot.cli
-```
-
-During the demonstration, enter `MENU` to return to the beginning, `ATENDENTE`
-to request human support, or `SAIR` to close the application.
-
-## Run the tests
-
-```powershell
-python -m unittest discover -s tests -v
-```
-
-The project has 43 automated cases covering menus, invalid input, contact
-validation, private storage, migration, backup, retention, duplicate events,
-Meta failures, inactivity timeout, human handoff, and restart behavior with
-persistent sessions. Continuous integration runs them on Windows and Linux.
-
-## Database and customer-data protection
-
-Production mode stores records and sessions in
-`data/private/castilla.sqlite3`. The private directory has restricted
-permissions and is excluded from Git because it contains personal information.
-
-Legacy JSONL files remain available after migration for review and recovery.
-Do not delete them until record counts, an encrypted backup, and a restore have
-all been verified. Imported pre-enrollments start as `needs_review`; after
-review, they can be marked converted or unconverted. Only unconverted records
-enter the school's 20-day retention process.
-
-Administrative commands create and verify encrypted backups, never overwrite
-an existing backup, and are not exposed through the webhook. Read the
-[data-protection plan](docs/protecao-de-dados-v1.md) (in Portuguese) before
-migrating records, changing statuses, or applying retention.
-
-## WhatsApp Business setup
-
-This project uses Meta's official WhatsApp Cloud API.
-
-1. Create a **Business** application in Meta for Developers and add the
-   **WhatsApp** product.
-2. Configure a WhatsApp Business Account and phone number.
-3. Obtain an access token, the **Phone Number ID**, and the Meta application
-   secret. A permanent system-user token is recommended for production.
-4. Copy the environment template:
-
-```powershell
-Copy-Item .env.exemple .env
-```
-
-5. Fill `.env` with the values from Meta:
-
-```dotenv
-WHATSAPP_VERIFY_TOKEN=create-your-own-secret-phrase
-WHATSAPP_ACCESS_TOKEN=your-meta-access-token
-WHATSAPP_PHONE_NUMBER_ID=your-whatsapp-phone-number-id
-META_APP_SECRET=your-meta-application-secret
-META_GRAPH_API_VERSION=v23.0
-OPERATOR_TOKEN=create-a-long-random-secret-here
-CASTILLA_ENV=production
-CASTILLA_STORAGE_BACKEND=sqlite
-CASTILLA_DB_PATH=data/private/castilla.sqlite3
-CASTILLA_INACTIVITY_SECONDS=30
-CASTILLA_BACKUP_KEY=your-44-character-fernet-key
-```
-
-Never commit the populated `.env` file or expose its values in screenshots,
-logs, or documentation. The Fernet key ends with `=`, must not contain extra
-spaces, and should be stored separately from backup files.
-
-6. For development without Docker, start the webhook directly:
-
-```powershell
-python -m castilla_bot.whatsapp
-```
-
-Normal container execution is documented in [Docker](#docker). Do not run the
-Python webhook and the container at the same time.
-
-The default port is `8000`. It can be changed through the `PORT` environment
-variable. `GET /` checks the process, `GET /ready` checks database access, and
-`GET /webhook` and `POST /webhook` verify and receive Meta events. Production
-mode (`CASTILLA_ENV=production`) refuses legacy JSONL storage.
-
-To close service from WhatsApp Business itself, set up App/Cloud API
-coexistence and subscribe the webhook to `smb_message_echoes`. The attendant
-must send the phrase in the customer's conversation from the school's number.
-The bot sends no reply on completion; it waits for the customer's next message.
-Verify that Meta delivers this event for your account before relying on it.
-
-As an alternative for an integrated attendant interface, call
-`POST /operator/complete` with `Authorization: Bearer <OPERATOR_TOKEN>` and this
-JSON body:
-
-```json
-{"customer_phone":"5561999999999","message":"atendimento finalizado"}
-```
-
-The phone number must match the identifier received by the webhook. This route
-does not message the customer; it only resumes the bot for the next customer
-message. Without `OPERATOR_TOKEN`, the route is disabled.
-
-With `CASTILLA_STORAGE_BACKEND=sqlite`, sessions are also stored in the private
-database, so restarting a single bot process does not release pending handoffs.
-The legacy `jsonl` mode still keeps sessions only in memory and must not pass
-the restart acceptance test. Keep one process (as in the Dockerfile); multiple
-processes need additional coordination.
-
-See the [human handoff test procedure](docs/teste-passagem-atendente.md) before
-enabling this flow in production.
-See the [critical 1.0 release criteria](docs/criterios-lancamento-v1.md).
-
-## Expose the local webhook with Cloudflare Tunnel
-
-A Cloudflare Quick Tunnel provides a temporary HTTPS URL for development and
-demonstrations. Its `trycloudflare.com` address changes whenever the tunnel is
-restarted and should not be used as a production endpoint. First keep exactly
-one bot instance running — either the container or direct Python execution —
-and confirm that `http://127.0.0.1:8000/ready` returns `ready`.
-
-In a second PowerShell window, check whether `cloudflared` is available:
-
-```powershell
-cloudflared --version
-```
-
-If Windows does not recognize the command, use the executable's full path:
-
-```powershell
-& "C:\Program Files (x86)\cloudflared\cloudflared.exe" --version
-```
-
-Start the tunnel with HTTP/2:
-
-```powershell
-cloudflared tunnel --protocol http2 --url http://localhost:8000
-```
-
-Alternatively, use the full path:
-
-```powershell
-& "C:\Program Files (x86)\cloudflared\cloudflared.exe" tunnel --protocol http2 --url http://localhost:8000
-```
-
-Cloudflare will display an address similar to:
-
-```text
-https://random-words.trycloudflare.com
-```
-
-Configure the following callback URL in Meta:
-
-```text
-https://random-words.trycloudflare.com/webhook
-```
-
-Use the exact value from `WHATSAPP_VERIFY_TOKEN` as the verification token.
-Subscribe to `messages` and, to recognize `atendimento finalizado` typed in the
-school's WhatsApp Business app, also confirm `smb_message_echoes`. The container
-and tunnel must remain active during local testing.
-
-Common issues:
-
-- **`cloudflared` is not recognized:** reopen PowerShell or use the full path.
-- **HTTP 502:** confirm that either the container or the Python webhook is
-  responding on port `8000`.
-- **DNS timeout or connection failure:** keep `--protocol http2`, disable the
-  VPN for the test, and verify outbound firewall access.
-- **Meta cannot validate the webhook:** check the `/webhook` suffix and ensure
-  the verification token has no extra spaces.
-
-## Docker
-
-Build the image after configuring the required environment variables:
-
-```powershell
-docker build -t castilla-bot .
-```
-
-The database must remain outside the disposable container. Mount the project's
-`data` directory before starting it:
-
-```powershell
-$castillaDataDir = (Resolve-Path ".\data").Path
-
-docker run --rm --name castilla-bot `
-  -p 8000:8000 `
-  --env-file ".env" `
-  --mount "type=bind,source=$castillaDataDir,target=/app/data" `
-  castilla-bot
-```
-
-Without the mount, SQLite would live inside the container and be lost when the
-container is removed. The container runs Gunicorn with one worker and exposes
-port `8000`. Do not run `python -m castilla_bot.whatsapp` at the same time.
-
-Check readiness from another PowerShell window:
-
-```powershell
-Invoke-RestMethod "http://127.0.0.1:8000/ready"
-```
-
-## Current scope and next steps
-
-The main flow, private SQLite storage, validation, duplicate-event protection,
-observable-failure handling, and inactivity timer are implemented. The
-remaining development work for version 1.0 is:
-
-- a restricted dashboard for bot, database, webhook, and Meta-failure health;
-- restoring automatic timers after a container restart;
-- an administrative panel for pre-enrollments and support requests;
-- structured logs, external alerts, and delivery-status monitoring;
-- an operational backup, restore, and retention routine with an audit trail;
-- full testing with the school's real account, then version and changelog updates.
-
-Permanent hosting and a stable HTTPS endpoint remain operational requirements
-for replacing the Quick Tunnel in production.
+## Setup and operations
+
+The Portuguese README is the single source for operational instructions, so
+the two files do not drift apart. See [README.pt-BR.md](README.pt-BR.md) for:
+
+- what is implemented, what is covered by automated tests, and what has been
+  validated on the school's real account (no bot flow so far);
+- local installation (`python -m pip install -c constraints.txt -e .`) and the
+  terminal demo (`python -m castilla_bot.cli`);
+- running the tests (`python -m unittest discover -s tests -v`);
+- WhatsApp Cloud API configuration, startup validation, and `.env.example`;
+- Cloudflare Quick Tunnel, Docker, and the production runbook in
+  [docs/hospedagem-v1.md](docs/hospedagem-v1.md);
+- current scope and next steps.
 
 ## Security considerations
 

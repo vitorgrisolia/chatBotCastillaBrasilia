@@ -24,11 +24,64 @@ externo, chave, frequência, prazo de guarda e teste de restauração. O prazo d
 
 ## Preparação já feita
 
-- `Dockerfile` executa um único processo do webhook.
+- `Dockerfile` executa um único processo do webhook, com quatro threads, usando
+  `exec` para que o Gunicorn receba o sinal de parada.
+- `docker-entrypoint.sh` ajusta o dono da pasta do banco no volume e executa o
+  serviço com o usuário `castilla`, sem privilégios.
+- `constraints.txt` fixa as versões das dependências usadas no build.
+- A CI constrói a imagem, inicia com SQLite temporário, consulta `/ready` e
+  reinicia o contêiner usando o mesmo volume.
 - `.dockerignore` impede que `.env`, cadastros e backups entrem no contexto de
   construção da imagem.
 - `fly.toml.example` configura HTTPS, região, volume, checagem de saúde e
   armazenamento SQLite persistente, mas contém um nome ilustrativo.
+
+## Roteiro de produção
+
+O `.env.example` serve para desenvolvimento. Em produção, configure as
+variáveis no cofre de segredos da hospedagem, nunca em arquivo versionado:
+
+| Variável | Valor em produção |
+| --- | --- |
+| `CASTILLA_ENV` | `production` (só `development` e `production` são aceitos) |
+| `CASTILLA_STORAGE_BACKEND` | `sqlite` (a aplicação recusa `jsonl` em produção) |
+| `CASTILLA_DB_PATH` | caminho dentro do volume, por exemplo `/data/private/castilla.sqlite3` |
+| `CASTILLA_INACTIVITY_SECONDS` | `30`, ou outro número finito maior que zero |
+| `WHATSAPP_*`, `META_*` | valores reais da Meta, sem espaços nas pontas |
+| `OPERATOR_TOKEN` | token longo e aleatório, ou vazio para desativar a rota |
+
+1. Crie o volume persistente e monte-o em `/data` (no Fly.io, a seção
+   `[mounts]` do `fly.toml.example`).
+2. Mantenha **uma máquina e um processo**. Os bloqueios por conversa ficam em
+   memória; outra instância não os enxerga.
+3. Implante a imagem e confira `GET /ready`. A resposta `ready` confirma que o
+   banco está acessível.
+4. Reinicie a máquina uma vez e confira `GET /ready` de novo. Uma conversa em
+   atendimento humano deve continuar em silêncio depois do reinício.
+5. Se a inicialização falhar por configuração inválida, o log mostra o nome da
+   variável. Corrija no cofre e implante de novo.
+
+## Operação
+
+Itens técnicos já definidos:
+
+- **Verificação:** `GET /ready` pela checagem de saúde da hospedagem e
+  `python -m castilla_bot.privacy_admin status` para contagens sem dados
+  pessoais.
+- **Backup externo:** `privacy_admin backup` e `verify-backup`, com a chave
+  `CASTILLA_BACKUP_KEY` guardada longe das cópias. Detalhes em
+  [proteção de dados](protecao-de-dados-v1.md).
+- **Retorno após falha:** restaurar o último backup verificado com
+  `restore-backup` em um banco novo, apontar `CASTILLA_DB_PATH` para ele e
+  conferir `/ready`. Se a nova versão falhar, implante a imagem anterior; o
+  callback da Meta só deve mudar depois do teste.
+- **Solicitações de atendimento:** cada registro em `atendimentos` traz o
+  campo `conversa` com o número do cliente.
+
+Pendentes de decisão da escola: quem responde pelos atendimentos humanos e como
+a equipe é avisada de uma nova solicitação, quem faz a verificação diária, onde
+ficam os backups externos e com que frequência, e quem pode executar o retorno
+após falha.
 
 ## O que falta antes da troca do WhatsApp
 

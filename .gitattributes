@@ -1,0 +1,2 @@
+# O script roda com sh dentro do contêiner Linux; CRLF quebraria a execução.
+*.sh text eol=lf

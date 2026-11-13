@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+import math
 import os
 from threading import RLock
 from typing import Any, Callable
@@ -43,23 +44,19 @@ Os exercícios ajudam a reforçar o aprendizado e permitem que o aluno avance pa
 
 Todas as aulas são on-line e ao vivo com professores."""
 
-PLANS = """📚 Conheça nossos planos:
+# Fonte única de planos e preços: a consulta, a escolha e o cadastro usam estes valores.
+PLAN_CATALOG = [
+    # (opção, medalha, nome, descrição, preço mensal)
+    ("1️⃣", "🥉", "Conversação", "Horas ilimitadas", "R$ 147,00"),
+    ("2️⃣", "🥉", "Básico", "3 horas de aula por semana", "R$ 197,00"),
+    ("3️⃣", "🥈", "Médio", "Aulas ilimitadas", "R$ 247,00"),
+    ("4️⃣", "🥇", "Top", "Aulas ilimitadas + 1 hora de aula particular por semana", "R$ 397,00"),
+]
 
-🥉 Plano Conversação
-Horas ilimitadas
-💰 R$ 147,00 por mês
-
-🥉 Plano Básico
-3 horas de aula por semana
-💰 R$ 197,00 por mês
-
-🥈 Plano Médio
-Aulas ilimitadas
-💰 R$ 247,00 por mês
-
-🥇 Plano Top
-Aulas ilimitadas + 1 hora de aula particular por semana
-💰 R$ 397,00 por mês
+PLANS = "📚 Conheça nossos planos:\n\n" + "\n\n".join(
+    f"{medal} Plano {name}\n{description}\n💰 {price} por mês"
+    for _, medal, name, description, price in PLAN_CATALOG
+) + """
 
 Todos os planos incluem:
 
@@ -68,14 +65,17 @@ Todos os planos incluem:
 ✅ Material didático digital
 ✅ Suporte durante o aprendizado"""
 
+PLANS_BY_OPTION = {
+    keycap[0]: f"{name} — {price}/mês" for keycap, _, name, _, price in PLAN_CATALOG
+}
+
 PLAN_SELECTION = """🎓 Ótimo! Vamos iniciar sua pré-matrícula.
 
 Primeiro, informe o plano escolhido:
 
-1️⃣ Conversação — R$ 147,00/mês
-2️⃣ Básico — R$ 197,00/mês
-3️⃣ Médio — R$ 247,00/mês
-4️⃣ Top — R$ 397,00/mês"""
+""" + "\n".join(
+    f"{keycap} {name} — {price}/mês" for keycap, _, name, _, price in PLAN_CATALOG
+)
 
 STUDENT_MENU = """Olá! Como podemos ajudar?
 
@@ -96,12 +96,10 @@ INACTIVITY_DONE = """⏱️ Atendimento automático encerrado por falta de inter
 
 Quando quiser continuar, envie uma nova mensagem para iniciar outro atendimento."""
 
-PLANS_BY_OPTION = {
-    "1": "Conversação — R$ 147,00/mês",
-    "2": "Básico — R$ 197,00/mês",
-    "3": "Médio — R$ 247,00/mês",
-    "4": "Top — R$ 397,00/mês",
-}
+# Limita o que fica guardado na sessão e no cadastro.
+MAX_MESSAGE_LENGTH = 500
+
+TOO_LONG = f"Mensagem muito longa. Envie no máximo {MAX_MESSAGE_LENGTH} caracteres."
 
 PRE_ENROLLMENT_FIELDS = [
     ("nome_completo", "Nome completo"),
@@ -118,6 +116,17 @@ STUDENT_SUBJECTS = {
     "4": "Dúvidas financeiras",
     "5": "Atendimento geral ao aluno",
 }
+
+
+def configured_environment() -> str:
+    """Lê CASTILLA_ENV aceitando só valores conhecidos.
+
+    Um erro de digitação em "production" não pode desligar as travas de produção.
+    """
+    environment = os.getenv("CASTILLA_ENV", "development")
+    if environment not in {"development", "production"}:
+        raise ValueError("CASTILLA_ENV deve ser development ou production")
+    return environment
 
 
 @dataclass
@@ -149,8 +158,8 @@ class CastillaBot:
         if storage is not None:
             self.storage = storage
         else:
-            backend = os.getenv("CASTILLA_STORAGE_BACKEND", "jsonl").casefold()
-            if os.getenv("CASTILLA_ENV", "development").casefold() == "production" and backend != "sqlite":
+            backend = os.getenv("CASTILLA_STORAGE_BACKEND", "jsonl")
+            if configured_environment() == "production" and backend != "sqlite":
                 raise RuntimeError("Em produção, CASTILLA_STORAGE_BACKEND deve ser sqlite")
             if backend == "sqlite":
                 self.storage = PrivateSqliteStorage(
@@ -168,11 +177,13 @@ class CastillaBot:
             float(os.getenv("CASTILLA_INACTIVITY_SECONDS", "30"))
             if inactivity_seconds is None else inactivity_seconds
         )
-        if configured_timeout <= 0:
-            raise ValueError("O tempo de inatividade deve ser maior que zero")
+        if not math.isfinite(configured_timeout) or configured_timeout <= 0:
+            raise ValueError("O tempo de inatividade deve ser um número finito maior que zero")
         self.inactivity_seconds = configured_timeout
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._lock = RLock()
+        # Registros criados durante o evento atual; são gravados junto com a sessão.
+        self._unsaved_records: list[tuple[str, dict[str, Any]]] = []
 
     def _session(self, session_id: str) -> Session | None:
         if self.session_storage is not None:
@@ -193,20 +204,30 @@ class CastillaBot:
         return self.sessions.get(session_id)
 
     def _save_session(self, session_id: str, session: Session) -> None:
+        records, self._unsaved_records = self._unsaved_records, []
+        for collection, record in records:
+            if collection == "atendimentos":
+                # A equipe precisa saber em qual conversa continuar o atendimento.
+                record["conversa"] = session_id
+        state = {
+            "state": session.state,
+            "data": session.data,
+            "field_index": session.field_index,
+            "selected_options": sorted(session.selected_options),
+            "pending_reply": session.pending_reply,
+            "pending_message_id": session.pending_message_id,
+            "processed_message_ids": session.processed_message_ids,
+            "last_activity_at": session.last_activity_at,
+        }
+        if records and self.session_storage is self.storage:
+            # Cadastro, estado e ID do evento na mesma transação: uma queda não
+            # deixa o cadastro salvo com a sessão antiga.
+            self.storage.save_session(session_id, state, records=records)
+            return
+        for collection, record in records:
+            self.storage.save(collection, record)
         if self.session_storage is not None:
-            self.session_storage.save_session(
-                session_id,
-                {
-                    "state": session.state,
-                    "data": session.data,
-                    "field_index": session.field_index,
-                    "selected_options": sorted(session.selected_options),
-                    "pending_reply": session.pending_reply,
-                    "pending_message_id": session.pending_message_id,
-                    "processed_message_ids": session.processed_message_ids,
-                    "last_activity_at": session.last_activity_at,
-                },
-            )
+            self.session_storage.save_session(session_id, state)
 
     def receive(self, session_id: str, message: str, message_id: str | None = None) -> str | None:
         """Processa um evento da Meta sem repetir efeitos de um ID já concluído."""
@@ -274,11 +295,11 @@ class CastillaBot:
                 session = Session()
                 self.sessions[session_id] = session
             response = self._handle_session(session_id, session, message)
-            if self.sessions[session_id] is session:
-                self._save_session(session_id, session)
+            self._save_session(session_id, self.sessions[session_id])
             return response
 
     def _handle_session(self, session_id: str, session: Session, message: str) -> str | None:
+        self._unsaved_records = []
         # Durante o atendimento humano, nem comandos do cliente reativam o bot.
         if session.state == "human_pending":
             return None
@@ -300,6 +321,8 @@ class CastillaBot:
             return self._start_human(session)
         if not answer:
             return INVALID
+        if len(answer) > MAX_MESSAGE_LENGTH:
+            return TOO_LONG
 
         handlers = {
             "main": self._main,
@@ -327,6 +350,15 @@ class CastillaBot:
             session.last_activity_at = None
             self._save_session(session_id, session)
             return True
+
+    def session_ids(self) -> list[str]:
+        """Conversas conhecidas, inclusive as gravadas antes de um reinício."""
+        with self._lock:
+            known = set(self.sessions)
+            list_sessions = getattr(self.session_storage, "session_ids", None)
+            if list_sessions is not None:
+                known.update(list_sessions())
+            return sorted(known)
 
     def inactivity_deadline(self, session_id: str) -> tuple[str, datetime] | None:
         """Retorna a atividade esperada e o prazo, ou None quando não há temporizador."""
@@ -437,8 +469,7 @@ class CastillaBot:
         if session.field_index < len(PRE_ENROLLMENT_FIELDS):
             return self._field_prompt(session)
 
-        record = self._record(session.data)
-        self.storage.save("pre_matriculas", record)
+        self._unsaved_records.append(("pre_matriculas", self._record(session.data)))
         plan = session.data["plano"]
         # O cadastro já está no armazenamento; a sessão não precisa guardar dados pessoais.
         session.data = {}
@@ -483,7 +514,7 @@ Obrigado por escolher o Castilla Idiomas Brasília! 📚✨
         return self._save_human(session)
 
     def _save_human(self, session: Session) -> str:
-        self.storage.save("atendimentos", self._record(session.data))
+        self._unsaved_records.append(("atendimentos", self._record(session.data)))
         session.data = {}
         session.state = "human_pending"
         return HUMAN_DONE

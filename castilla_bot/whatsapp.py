@@ -9,13 +9,13 @@ import os
 import re
 from datetime import datetime, timezone
 from threading import Lock, Timer
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 import requests
 from dotenv import load_dotenv
 from flask import Flask, Response, jsonify, request
 
-from .bot import CastillaBot, HUMAN_DONE, INACTIVITY_DONE
+from .bot import CastillaBot, HUMAN_DONE, INACTIVITY_DONE, configured_environment
 from .private_storage import PrivateSqliteStorage
 
 
@@ -50,7 +50,8 @@ class WhatsAppClient:
                 "type": "text",
                 "text": {"preview_url": False, "body": text},
             },
-            timeout=15,
+            # Conexão e leitura limitadas: uma chamada lenta não segura a thread por muito tempo.
+            timeout=(5, 10),
         )
         response.raise_for_status()
 
@@ -125,13 +126,15 @@ def create_app(
     contact_locks = [Lock() for _ in range(64)]
     chatbot = bot or CastillaBot()
     if (
-        os.getenv("CASTILLA_ENV", "development").casefold() == "production"
+        configured_environment() == "production"
         and not isinstance(chatbot.storage, PrivateSqliteStorage)
     ):
         raise RuntimeError("Em produção, o armazenamento deve ser SQLite privado")
     configured_operator_token = (
         os.getenv("OPERATOR_TOKEN", "") if operator_token is None else operator_token
     )
+    if configured_operator_token in _EXAMPLE_VALUES:
+        raise RuntimeError("OPERATOR_TOKEN ainda tem o valor de exemplo; troque ou deixe vazio")
     if client is None:
         environment = _configuration_from_environment()
         configured_verify_token = verify_token or environment["WHATSAPP_VERIFY_TOKEN"]
@@ -174,6 +177,11 @@ def create_app(
         else:
             expected_activity, expires_at = deadline
             scheduler.schedule(customer, expected_activity, expires_at)
+
+    # Os temporizadores ficam em memória; após um reinício, refaça-os a partir
+    # das sessões gravadas. Prazos já vencidos disparam logo em seguida.
+    for known_customer in chatbot.session_ids():
+        refresh_inactivity(known_customer)
 
     @app.get("/")
     def health() -> dict[str, str]:
@@ -287,70 +295,99 @@ def _configuration_from_environment() -> dict[str, str]:
             "Configuração do WhatsApp incompleta. Copie .env.example para .env, "
             f"preencha os valores reais e tente novamente. Ausentes: {names}"
         )
+    # Só os nomes das variáveis aparecem no erro; os valores podem ser segredos.
+    invalid = [
+        name for name, value in values.items()
+        if value != value.strip() or value in _EXAMPLE_VALUES
+    ]
+    if not re.fullmatch(r"v[0-9]+\.[0-9]+", values["META_GRAPH_API_VERSION"]):
+        invalid.append("META_GRAPH_API_VERSION")
+    if invalid:
+        names = ", ".join(sorted(set(invalid)))
+        raise RuntimeError(
+            "Configuração do WhatsApp inválida: remova espaços extras e troque os "
+            f"valores de exemplo pelos valores reais. Verifique: {names}"
+        )
     return values
+
+
+# Valores ilustrativos do .env.example e do README.
+_EXAMPLE_VALUES = {
+    "crie-uma-frase-secreta-aqui",
+    "crie-sua-frase-secreta",
+    "token-de-acesso-da-meta",
+    "seu-token-de-acesso-da-meta",
+    "id-do-numero-do-whatsapp",
+    "chave-secreta-do-aplicativo-meta",
+    "crie-um-token-longo-e-aleatorio-aqui",
+}
+
+
+def _change_values(
+    payload: dict[str, Any], fields: tuple[str | None, ...], phone_number_id: str
+) -> Iterator[dict[str, Any]]:
+    """Percorre o evento ignorando partes com estrutura inesperada.
+
+    Um payload malformado não deve gerar 503, senão a Meta o reenvia sem fim.
+    """
+    for entry in _dict_items(payload, "entry"):
+        for change in _dict_items(entry, "changes"):
+            if change.get("field") not in fields:
+                continue
+            value = change.get("value")
+            if isinstance(value, dict) and _for_business_number(value, phone_number_id):
+                yield value
+
+
+def _dict_items(container: dict[str, Any], key: str) -> list[dict[str, Any]]:
+    items = container.get(key)
+    if not isinstance(items, list):
+        return []
+    return [item for item in items if isinstance(item, dict)]
 
 
 def _text_messages(
     payload: dict[str, Any], phone_number_id: str = ""
 ) -> list[dict[str, Any]]:
-    messages: list[dict[str, Any]] = []
-    for entry in payload.get("entry", []):
-        for change in entry.get("changes", []):
-            if change.get("field") not in (None, "messages"):
-                continue
-            value = change.get("value", {})
-            if not _for_business_number(value, phone_number_id):
-                continue
-            for message in value.get("messages", []):
-                if (
-                    message.get("type") == "text"
-                    and isinstance(message.get("from"), str)
-                    and isinstance(message.get("text"), dict)
-                    and isinstance(message["text"].get("body"), str)
-                ):
-                    messages.append(message)
-    return messages
+    return [
+        message
+        for value in _change_values(payload, (None, "messages"), phone_number_id)
+        for message in _dict_items(value, "messages")
+        if (
+            message.get("type") == "text"
+            and isinstance(message.get("from"), str)
+            and isinstance(message.get("text"), dict)
+            and isinstance(message["text"].get("body"), str)
+        )
+    ]
 
 
 def _business_app_message_echoes(
     payload: dict[str, Any], phone_number_id: str = ""
 ) -> list[dict[str, Any]]:
     """Extrai mensagens enviadas pelo atendente no app WhatsApp Business."""
-    echoes: list[dict[str, Any]] = []
-    for entry in payload.get("entry", []):
-        for change in entry.get("changes", []):
-            if change.get("field") != "smb_message_echoes":
-                continue
-            value = change.get("value", {})
-            if not _for_business_number(value, phone_number_id):
-                continue
-            for echo in value.get("message_echoes", []):
-                if (
-                    echo.get("type") == "text"
-                    and isinstance(echo.get("to"), str)
-                    and isinstance(echo.get("text"), dict)
-                    and isinstance(echo["text"].get("body"), str)
-                ):
-                    echoes.append(echo)
-    return echoes
+    return [
+        echo
+        for value in _change_values(payload, ("smb_message_echoes",), phone_number_id)
+        for echo in _dict_items(value, "message_echoes")
+        if (
+            echo.get("type") == "text"
+            and isinstance(echo.get("to"), str)
+            and isinstance(echo.get("text"), dict)
+            and isinstance(echo["text"].get("body"), str)
+        )
+    ]
 
 
 def _failed_delivery_statuses(
     payload: dict[str, Any], phone_number_id: str = ""
 ) -> list[dict[str, Any]]:
-    failed: list[dict[str, Any]] = []
-    for entry in payload.get("entry", []):
-        for change in entry.get("changes", []):
-            if change.get("field") not in (None, "messages"):
-                continue
-            value = change.get("value", {})
-            if not _for_business_number(value, phone_number_id):
-                continue
-            failed.extend(
-                status for status in value.get("statuses", [])
-                if isinstance(status, dict) and status.get("status") == "failed"
-            )
-    return failed
+    return [
+        status
+        for value in _change_values(payload, (None, "messages"), phone_number_id)
+        for status in _dict_items(value, "statuses")
+        if status.get("status") == "failed"
+    ]
 
 
 def _for_business_number(value: dict[str, Any], phone_number_id: str) -> bool:

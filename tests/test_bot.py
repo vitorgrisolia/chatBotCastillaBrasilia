@@ -1,6 +1,8 @@
 import json
+import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -8,6 +10,9 @@ from castilla_bot.bot import (
     CastillaBot,
     INACTIVITY_DONE,
     INVALID,
+    PLAN_CATALOG,
+    PLAN_SELECTION,
+    PLANS,
     PRE_ENROLLMENT_FIELDS,
     WELCOME,
     PendingDelivery,
@@ -119,6 +124,33 @@ class CastillaBotTests(unittest.TestCase):
         self.assertEqual(record["email"], "Aluna@example.com")
         self.assertEqual(record["cpf"], "52998224725")
         self.assertEqual(record["whatsapp"], "5561999999999")
+
+    def test_price_shown_selected_and_saved_come_from_same_plan(self):
+        for keycap, _, name, _, price in PLAN_CATALOG:
+            option = keycap[0]
+            with self.subTest(plano=name):
+                self.assertIn(f"Plano {name}\n", PLANS)
+                self.assertIn(f"💰 {price} por mês", PLANS)
+                self.assertIn(f"{keycap} {name} — {price}/mês", PLAN_SELECTION)
+                session = f"plano-{option}"
+                self.bot.start(session)
+                self.bot.handle(session, "4")
+                self.bot.handle(session, option)
+                for answer in ("Maria", "Rua Central", "maria@example.com",
+                               "529.982.247-25", "(61) 99999-9999"):
+                    response = self.bot.handle(session, answer)
+                self.assertIn(f"Plano escolhido: {name} — {price}/mês", response)
+        path = Path(self.temp_dir.name) / "pre_matriculas.jsonl"
+        saved = [json.loads(line)["plano"] for line in path.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(saved, [f"{name} — {price}/mês" for _, _, name, _, price in PLAN_CATALOG])
+
+    def test_human_request_records_conversation_to_continue(self):
+        self.bot.handle(self.session, "6")
+        self.bot.handle(self.session, "Maria")
+        self.bot.handle(self.session, "Dúvida")
+        path = Path(self.temp_dir.name) / "atendimentos.jsonl"
+        record = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(record["conversa"], self.session)
 
     def test_invalid_email_and_whatsapp_do_not_advance_or_save(self):
         self.bot.handle(self.session, "4")
@@ -249,6 +281,28 @@ class SessionPrivacyTests(unittest.TestCase):
         self.bot.reply_delivered(self.session, "final")
         self.assertIsNone(self.bot.receive(self.session, self.PERSONAL_ANSWERS[-1], "final"))
         self.assertEqual(self.bot.storage.counts(), {"pre_matriculas:pending": 1})
+
+    def test_failure_saving_session_does_not_keep_pre_enrollment(self):
+        for message in ("Olá", "4", "2", *self.PERSONAL_ANSWERS[:-1]):
+            self._send(message)
+        # Simula queda entre gravar o cadastro e gravar a sessão concluída.
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            connection.execute(
+                """CREATE TRIGGER fail_session BEFORE UPDATE ON sessions
+                WHEN NEW.state LIKE '%Pré-matrícula recebida%'
+                BEGIN SELECT RAISE(ABORT, 'falha simulada'); END"""
+            )
+        with self.assertRaises(sqlite3.DatabaseError):
+            self.bot.receive(self.session, self.PERSONAL_ANSWERS[-1], "final")
+        self.assertEqual(self.storage.counts(), {})
+
+        with closing(sqlite3.connect(self.database)) as connection, connection:
+            connection.execute("DROP TRIGGER fail_session")
+        self.bot = CastillaBot(PrivateSqliteStorage(self.database))
+        reply = self.bot.receive(self.session, self.PERSONAL_ANSWERS[-1], "final")
+        self.assertIn("Pré-matrícula recebida", reply)
+        self.assertEqual(self.bot.receive(self.session, self.PERSONAL_ANSWERS[-1], "final"), reply)
+        self.assertEqual(self.storage.counts(), {"pre_matriculas:pending": 1})
 
     def test_human_handoff_does_not_keep_name_and_subject_in_session(self):
         for message in ("Olá", "6", "Maria da Silva", "Dúvida sobre boleto"):

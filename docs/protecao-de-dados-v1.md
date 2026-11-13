@@ -26,6 +26,12 @@ definição jurídica das finalidades e prazos de guarda da escola.
 - A importação dos JSONL é explícita e não apaga os arquivos de origem. As
   pré-matrículas antigas entram como `needs_review`, fora da exclusão dos 20
   dias, até um responsável confirmar se viraram matrícula.
+- A sessão da conversa não guarda os dados pessoais depois que a
+  pré-matrícula ou a solicitação de atendimento é salva. Assim, excluir um
+  cadastro pela retenção não deixa uma cópia dele na tabela `sessions`.
+- A solicitação de atendimento salva o número do cliente no campo `conversa`,
+  para a equipe localizar a conversa. O prazo de guarda desses registros ainda
+  precisa ser definido.
 - O relatório de retenção mostra apenas IDs e contagens. A exclusão exige uma
   opção explícita e faz antes um backup cifrado e verificado.
 - O backup usa Fernet. A chave (`CASTILLA_BACKUP_KEY`) deve ficar fora do Git e

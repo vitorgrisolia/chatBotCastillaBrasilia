@@ -13,7 +13,11 @@ import requests
 from castilla_bot.bot import CastillaBot
 from castilla_bot.private_storage import PrivateSqliteStorage
 from castilla_bot.storage import JsonlStorage
-from castilla_bot.whatsapp import _safe_error_label, create_app
+from castilla_bot.whatsapp import (
+    _configuration_from_environment,
+    _safe_error_label,
+    create_app,
+)
 
 
 class FakeWhatsAppClient:
@@ -367,6 +371,116 @@ class WhatsAppWebhookTests(unittest.TestCase):
 
         self.assertEqual(self._post_signed(self._message_payload("Olá novamente"), app=app).status_code, 200)
         self.assertIn("Seja bem-vindo", sender.sent[-1][1])
+
+    def test_expired_inactivity_is_closed_after_restart(self):
+        database = f"{self.temp_dir.name}/private/castilla.sqlite3"
+        first_app = create_app(
+            bot=CastillaBot(PrivateSqliteStorage(database), inactivity_seconds=60),
+            client=FakeWhatsAppClient(),
+            app_secret="app-secret-de-teste",
+            phone_number_id="school-test-id",
+        ).test_client()
+        self._post_signed(self._message_payload("Olá"), app=first_app)
+
+        # O novo processo usa prazo curto para o teste não esperar 60 segundos.
+        restarted_sender = FakeWhatsAppClient()
+        create_app(
+            bot=CastillaBot(PrivateSqliteStorage(database), inactivity_seconds=0.05),
+            client=restarted_sender,
+            app_secret="app-secret-de-teste",
+            phone_number_id="school-test-id",
+        )
+        deadline = time.monotonic() + 1
+        while not restarted_sender.sent and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(len(restarted_sender.sent), 1)
+        self.assertIn("encerrado por falta de interação", restarted_sender.sent[0][1])
+        self.assertIsNone(PrivateSqliteStorage(database).load_session("5561999999999")["last_activity_at"])
+
+    def test_failed_delivery_record_resends_once_and_does_not_advance_twice(self):
+        bot = CastillaBot(JsonlStorage(self.temp_dir.name))
+        app = create_app(
+            bot=bot,
+            client=self.sender,
+            app_secret="app-secret-de-teste",
+            phone_number_id="school-test-id",
+        ).test_client()
+        first = self._message_payload("Olá")
+        original = bot.reply_delivered
+        with patch.object(bot, "reply_delivered", side_effect=OSError("disco cheio")):
+            self.assertEqual(self._post_signed(first, app=app).status_code, 503)
+        self.assertEqual(len(self.sender.sent), 1)
+        bot.reply_delivered = original
+
+        # O envio já tinha saído, mas o registro falhou: a repetição reenvia a
+        # mesma resposta uma vez. Essa duplicação é a limitação conhecida.
+        self.assertEqual(self._post_signed(first, app=app).status_code, 200)
+        self.assertEqual(self._post_signed(first, app=app).status_code, 200)
+        self.assertEqual(len(self.sender.sent), 2)
+        self.assertEqual(self.sender.sent[0], self.sender.sent[1])
+        self._post_signed(self._message_payload("3"), app=app)
+        self.assertIn("Conheça nossos planos", self.sender.sent[-1][1])
+
+    def test_unexpected_payload_structure_is_acknowledged_without_reply(self):
+        for payload in (
+            {"entry": "texto"},
+            {"entry": [None, {"changes": "x"}]},
+            {"entry": [{"changes": [None, {"value": []}]}]},
+            {"entry": [{"changes": [{"value": {"messages": "x", "statuses": [1]}}]}]},
+            {"entry": [{"changes": [{"value": {"messages": [None, {"type": "text"}]}}]}]},
+        ):
+            with self.subTest(payload=payload):
+                self.assertEqual(self._post_signed(payload).status_code, 200)
+        self.assertEqual(self.sender.sent, [])
+
+    def test_long_message_is_rejected_without_saving(self):
+        self._post_signed(self._message_payload("Olá"))
+        self._post_signed(self._message_payload("6"))
+        self._post_signed(self._message_payload("x" * 501))
+        self.assertIn("Mensagem muito longa", self.sender.sent[-1][1])
+        self._post_signed(self._message_payload("Maria"))
+        self.assertIn("assunto", self.sender.sent[-1][1])
+
+    def test_configuration_rejects_examples_spaces_and_bad_version(self):
+        valid = {
+            "WHATSAPP_VERIFY_TOKEN": "verify-test",
+            "WHATSAPP_ACCESS_TOKEN": "access-test",
+            "WHATSAPP_PHONE_NUMBER_ID": "123456",
+            "META_APP_SECRET": "secret-test",
+            "META_GRAPH_API_VERSION": "v23.0",
+        }
+        with patch.dict("os.environ", valid):
+            self.assertEqual(_configuration_from_environment(), valid)
+        for name, value in (
+            ("WHATSAPP_ACCESS_TOKEN", "token-de-acesso-da-meta"),
+            ("META_APP_SECRET", "secret-test "),
+            ("META_GRAPH_API_VERSION", "23.0"),
+        ):
+            with self.subTest(name=name), patch.dict("os.environ", {**valid, name: value}):
+                with self.assertRaisesRegex(RuntimeError, name) as raised:
+                    _configuration_from_environment()
+                self.assertNotIn(value.strip(), str(raised.exception))
+
+    def test_operator_token_example_value_is_refused(self):
+        with self.assertRaisesRegex(RuntimeError, "OPERATOR_TOKEN"):
+            create_app(
+                bot=CastillaBot(JsonlStorage(self.temp_dir.name)),
+                client=FakeWhatsAppClient(),
+                operator_token="crie-um-token-longo-e-aleatorio-aqui",
+            )
+
+    def test_environment_and_inactivity_accept_only_known_values(self):
+        for value in ("producton", "Production", "production "):
+            with self.subTest(env=value), patch.dict("os.environ", {"CASTILLA_ENV": value}):
+                with self.assertRaisesRegex(ValueError, "CASTILLA_ENV"):
+                    create_app(
+                        bot=CastillaBot(JsonlStorage(self.temp_dir.name)),
+                        client=FakeWhatsAppClient(),
+                    )
+        for timeout in (float("nan"), float("inf"), 0):
+            with self.subTest(timeout=timeout):
+                with self.assertRaisesRegex(ValueError, "inatividade"):
+                    CastillaBot(JsonlStorage(self.temp_dir.name), inactivity_seconds=timeout)
 
     @staticmethod
     def _message_payload(text):

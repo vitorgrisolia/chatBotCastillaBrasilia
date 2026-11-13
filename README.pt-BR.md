@@ -23,12 +23,20 @@ identificação estável do cliente e trocar mensagens de texto.
 - Integração com a API oficial WhatsApp Cloud por meio de um webhook Flask.
 - Verificação do webhook da Meta e validação de assinatura HMAC-SHA256.
 - Persistência de cadastros e sessões em banco SQLite privado no modo de produção.
-- Prevenção de mensagens duplicadas e reenvio seguro após falhas observáveis da Meta.
-- Encerramento do atendimento automático após 30 segundos sem interação.
+- Prevenção de mensagens duplicadas e repetição do envio após falhas observáveis da Meta. Se a Meta entregar a mensagem e a confirmação se perder, o cliente pode recebê-la duas vezes.
+- Encerramento do atendimento automático após 30 segundos sem interação, inclusive para prazos que venceram enquanto o serviço estava parado.
 - Migração controlada dos arquivos JSONL, backup cifrado e retenção de 20 dias.
 - Injeção de dependências para testes isolados do bot e do webhook.
-- Suporte a Docker e execução em produção com Gunicorn.
+- Suporte a Docker e execução em produção com Gunicorn, em um processo com várias threads e usuário sem privilégios.
 - Testes automatizados do fluxo de conversa e da integração com o WhatsApp.
+
+## O que está implementado, testado e validado
+
+| Situação | O que significa | Itens |
+| --- | --- | --- |
+| Implementado com testes automatizados | Há código e testes que a CI do GitHub roda em Windows e Linux. Os testes simulam a Meta e não provam o comportamento da conta real. | Fluxo de conversa, validações, SQLite privado, transação entre cadastro e sessão, deduplicação, falhas de envio simuladas, temporizador e sua recuperação após reinício, passagem ao atendente, backup e retenção. |
+| Implementado com teste de Docker na CI | A CI constrói a imagem, inicia com SQLite temporário, consulta `/ready` e reinicia usando o mesmo volume. | `Dockerfile`, `docker-entrypoint.sh`, usuário sem privilégios, parada do Gunicorn. |
+| Validado na conta real da escola | Teste feito com o número real e eventos reais da Meta. | Nenhum fluxo do bot, segundo os registros do projeto. Veja os [critérios de lançamento](docs/criterios-lancamento-v1.md) e o [roteiro de teste da passagem para o atendente](docs/teste-passagem-atendente.md). |
 
 ## Fluxo de atendimento
 
@@ -65,7 +73,18 @@ persistida no banco SQLite privado quando o backend `sqlite` está ativo, com:
 O estado atual seleciona a função responsável por tratar cada nova mensagem.
 Essa função valida a opção, atualiza a sessão e devolve a próxima resposta. Ao
 final, pré-matrículas e solicitações de atendimento são armazenadas em JSONL
-no modo de desenvolvimento ou no banco privado no modo de produção.
+no modo de desenvolvimento ou no banco privado no modo de produção. No banco
+privado, o cadastro, o novo estado da sessão e o ID da mensagem da Meta são
+gravados na mesma transação. No modo JSONL não há transação.
+
+Depois de salvar a pré-matrícula, a sessão deixa de guardar nome, endereço,
+e-mail, CPF e WhatsApp. O mesmo vale para nome e assunto na passagem ao
+atendente. A solicitação de atendimento salva inclui o campo `conversa`, com o
+número do cliente, para a equipe localizar a conversa.
+
+Planos e preços ficam em uma única lista (`PLAN_CATALOG` em `bot.py`). A
+consulta de planos, a escolha na pré-matrícula e o cadastro salvo usam essa
+lista. Os valores estão no código; confirme com a escola se continuam válidos.
 
 No WhatsApp, a Meta envia eventos ao webhook Flask. A aplicação verifica a
 assinatura da requisição, extrai as mensagens de texto, utiliza o telefone do
@@ -76,7 +95,9 @@ Durante o fluxo automático, cada mensagem do cliente reinicia um temporizador
 de 30 segundos. Se não houver nova interação, o bot envia uma única mensagem de
 encerramento, limpa aquela sessão e começa um atendimento novo na próxima
 mensagem. O temporizador é cancelado ao entrar em atendimento humano: nessa
-etapa, o bot continua aguardando o encerramento escrito pelo atendente.
+etapa, o bot continua aguardando o encerramento escrito pelo atendente. Os
+temporizadores ficam em memória; ao iniciar, o webhook os recria a partir das
+sessões gravadas no banco, e prazos já vencidos são encerrados logo em seguida.
 
 Após encaminhar o cliente a um atendente, o bot envia uma única confirmação e
 permanece em silêncio, inclusive para `MENU` e `REINICIAR`. Se o número da
@@ -117,8 +138,10 @@ tests/
 ├── test_validation.py
 └── test_whatsapp.py
 .github/workflows/ci.yml # Testes automáticos no GitHub
-.env.exemple        # Modelo das variáveis de ambiente
+.env.example        # Modelo das variáveis de ambiente para desenvolvimento
+constraints.txt     # Versões fixas das dependências para Docker e CI
 Dockerfile          # Imagem de contêiner para publicação
+docker-entrypoint.sh # Ajusta a pasta do banco e troca para usuário sem privilégios
 fly.toml.example    # Modelo de hospedagem permanente
 pyproject.toml      # Metadados e dependências do pacote
 ```
@@ -144,11 +167,11 @@ python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 ```
 
-Instale o projeto:
+Instale o projeto com as versões fixas de `constraints.txt`:
 
 ```powershell
 python -m pip install --upgrade pip
-python -m pip install -e .
+python -m pip install -c constraints.txt -e .
 ```
 
 Inicie a demonstração no terminal:
@@ -169,11 +192,12 @@ menu antes de concluir, ela continua disponível.
 python -m unittest discover -s tests -v
 ```
 
-O projeto possui 43 casos automatizados para menus, respostas inválidas,
-validação de contatos, banco privado, migração, backup, retenção, mensagens
-duplicadas, falhas da Meta, temporizador, passagem ao atendente e reinício com
-sessões persistentes. A rotina de integração contínua executa esses testes em
-Windows e Linux quando as mudanças são enviadas ao GitHub.
+Os testes cobrem menus, respostas inválidas, validação de contatos, banco
+privado, migração, backup, retenção, mensagens duplicadas, falhas da Meta,
+temporizador, passagem ao atendente, reinício com sessões persistentes,
+payloads malformados e validação da configuração. A integração contínua executa
+esses testes em Windows e Linux e testa a imagem Docker quando as mudanças são
+enviadas ao GitHub.
 
 ## Banco de dados e proteção dos cadastros
 
@@ -203,27 +227,23 @@ O projeto utiliza a API oficial WhatsApp Cloud da Meta.
 3. Obtenha o token de acesso, o **Phone Number ID** e a chave secreta do
    aplicativo. Em produção, recomenda-se um token permanente de usuário do
    sistema.
-4. Copie o modelo de variáveis de ambiente:
+4. Copie o modelo de variáveis de ambiente para desenvolvimento:
 
 ```powershell
-Copy-Item .env.exemple .env
+Copy-Item .env.example .env
 ```
 
-5. Preencha o `.env` com os dados fornecidos pela Meta:
+5. Preencha o `.env` com os dados fornecidos pela Meta. O modelo usa
+   `CASTILLA_ENV=development` e `CASTILLA_STORAGE_BACKEND=jsonl`. Para produção,
+   com SQLite e volume persistente, siga o
+   [roteiro de produção](docs/hospedagem-v1.md#roteiro-de-produção).
 
-```dotenv
-WHATSAPP_VERIFY_TOKEN=crie-sua-frase-secreta
-WHATSAPP_ACCESS_TOKEN=seu-token-de-acesso-da-meta
-WHATSAPP_PHONE_NUMBER_ID=id-do-numero-do-whatsapp
-META_APP_SECRET=chave-secreta-do-aplicativo-meta
-META_GRAPH_API_VERSION=v23.0
-OPERATOR_TOKEN=crie-um-token-longo-e-aleatorio-aqui
-CASTILLA_ENV=production
-CASTILLA_STORAGE_BACKEND=sqlite
-CASTILLA_DB_PATH=data/private/castilla.sqlite3
-CASTILLA_INACTIVITY_SECONDS=30
-CASTILLA_BACKUP_KEY=chave-fernet-de-44-caracteres
-```
+Ao iniciar, o webhook recusa variáveis vazias, valores de exemplo do
+`.env.example`, espaços nas pontas e `META_GRAPH_API_VERSION` fora do formato
+`v23.0`. `CASTILLA_ENV` aceita só `development` ou `production`, e
+`CASTILLA_STORAGE_BACKEND` só `jsonl` ou `sqlite`; qualquer outro valor impede a
+inicialização. `CASTILLA_INACTIVITY_SECONDS` precisa ser um número finito maior
+que zero. As mensagens de erro mostram o nome da variável, nunca o valor.
 
 Nunca envie o `.env` preenchido ao Git nem exponha seus valores em capturas de
 tela, logs ou documentos. A chave Fernet termina com `=`, não pode conter
@@ -265,8 +285,10 @@ Sem `OPERATOR_TOKEN`, a rota fica desativada.
 Com `CASTILLA_STORAGE_BACKEND=sqlite`, as sessões também ficam no banco privado:
 reiniciar um único processo do bot não libera atendimentos pendentes. O modo
 antigo (`jsonl`) ainda mantém as sessões só na memória e **não deve ser usado
-para aprovar o teste de reinício**. Mantenha um único processo (como no
-Dockerfile); múltiplos processos exigem coordenação adicional.
+para aprovar o teste de reinício**. Mantenha um único processo e uma única
+instância (como no Dockerfile). As threads do Gunicorn compartilham os bloqueios
+por contato do mesmo processo; vários processos ou máquinas exigem coordenação
+adicional, e um SQLite persistente sozinho não resolve isso.
 
 Veja o [roteiro de teste da passagem para o atendente](docs/teste-passagem-atendente.md)
 antes de liberar esse fluxo em produção.
@@ -340,10 +362,11 @@ Depois de configurar as variáveis de ambiente, construa a imagem:
 docker build -t castilla-bot .
 ```
 
-O banco precisa permanecer fora do contêiner. No PowerShell, monte a pasta
-`data` do projeto antes de iniciar:
+O banco precisa permanecer fora do contêiner. No PowerShell, crie a pasta
+`data` (em um checkout novo ela não existe) e monte-a antes de iniciar:
 
 ```powershell
+New-Item -ItemType Directory -Force -Path ".\data" | Out-Null
 $castillaDataDir = (Resolve-Path ".\data").Path
 
 docker run --rm --name castilla-bot `
@@ -354,8 +377,11 @@ docker run --rm --name castilla-bot `
 ```
 
 Sem o `--mount`, o SQLite ficaria dentro do contêiner e seria perdido quando o
-contêiner fosse removido. O contêiner utiliza Gunicorn com um processo e expõe
-a porta `8000`. Não execute simultaneamente `python -m castilla_bot.whatsapp`.
+contêiner fosse removido. O contêiner utiliza Gunicorn com um processo e quatro
+threads e expõe a porta `8000`. O `docker-entrypoint.sh` ajusta o dono da pasta
+do banco e executa o Gunicorn com o usuário `castilla`, sem privilégios. Se a
+montagem não permitir mudar o dono, ele avisa no log e continua como root. Não
+execute simultaneamente `python -m castilla_bot.whatsapp`.
 
 Em outro PowerShell, confirme a prontidão:
 
@@ -370,7 +396,7 @@ duplicados, o tratamento de falhas observáveis e o temporizador já estão
 implementados. Para fechar o desenvolvimento da versão 1.0, permanecem:
 
 - dashboard restrito para saúde do bot, banco, webhook e falhas da Meta;
-- restauração dos temporizadores automáticos após reinício do contêiner;
+- forma de a equipe receber e acompanhar as solicitações de atendimento;
 - painel administrativo para pré-matrículas e solicitações de atendimento;
 - logs estruturados, alertas externos e acompanhamento de entrega;
 - rotina operacional de backup, restauração e retenção com registro das ações;

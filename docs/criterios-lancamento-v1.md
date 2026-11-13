@@ -13,7 +13,11 @@ Veja a [proposta de hospedagem permanente](hospedagem-v1.md).
 | Crítica | Sessões e cadastros | Ativar banco privado após cópia e revisão dos arquivos antigos. Verificar que a passagem ao atendente continua silenciosa após reinício. |
 | Crítica | Segurança dos dados | Definir quem acessa, onde ficam os backups, restauração e retenção; não remover arquivos antigos sem conferência. |
 
-## Situação verificada em 18/09/2026
+## Registro histórico de 18/09/2026
+
+Esta seção registra o que foi observado naquela data. Ela não comprova a
+configuração atual do servidor, do `.env` nem da conta da Meta; confira de novo
+antes de usar qualquer item como prova.
 
 - Há um processo local do bot e um Cloudflare Quick Tunnel em execução. Eles
   **não** constituem hospedagem permanente.
@@ -32,13 +36,18 @@ Veja a [proposta de hospedagem permanente](hospedagem-v1.md).
 ## Limite do tratamento de falhas atual
 
 Quando o envio falha de forma observável, o webhook devolve 503 para permitir
-novo envio do evento, mantendo a resposta pendente. IDs de mensagens já
+novo envio do evento, mantendo a resposta pendente. No SQLite, o cadastro, o
+estado da sessão e o ID da mensagem são gravados na mesma transação, então uma
+queda nesse ponto não deixa cadastro salvo com a sessão antiga. IDs de mensagens já
 concluídas são lembrados por conversa para evitar reprocessamento comum. Isso
 não garante “exatamente uma entrega” se a Meta receber a mensagem, mas a
-conexão cair antes de confirmar o envio. Antes de liberar produção, defina a
+conexão cair antes de confirmar o envio, ou se a gravação da confirmação
+falhar. Nesses casos o cliente pode receber a mesma resposta duas vezes. Antes de liberar produção, defina a
 política operacional para esse caso e monitore falhas de entrega. O código
-foi preparado para **um processo**; execução concorrente em vários processos
-exige coordenação transacional adicional.
+foi preparado para **um processo**, com várias threads do Gunicorn. Cada envio
+à Meta espera no máximo 5 segundos para conectar e 10 para ler a resposta.
+Execução concorrente em vários processos ou máquinas exige coordenação
+transacional adicional.
 
 Referências da Meta: [webhook HTTPS e estrutura dos eventos](https://www.postman.com/meta/whatsapp-business-platform/folder/tduohwq/webhook-payload-reference),
 [inscrição da WABA](https://www.postman.com/meta/whatsapp-business-platform/folder/ypn8q0n/webhook-subscriptions),
